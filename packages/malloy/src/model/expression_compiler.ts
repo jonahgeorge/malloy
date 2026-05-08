@@ -216,11 +216,44 @@ function compileExpr<T extends Expr>(
       case '<':
       case '>=':
       case '<=':
-      case '=':
-        return `${expr.kids.left.sql}${expr.node}${expr.kids.right.sql}`;
+      case '=': {
+        let leftSql = expr.kids.left.sql ?? '';
+        let rightSql = expr.kids.right.sql ?? '';
+        // T-SQL: comparing a BIT column with a boolean literal needs the
+        // value form (`CAST(1 AS BIT)`) — comparing against the predicate
+        // form `(1=1)` produces a syntax error since `<col>=<predicate>`
+        // mixes value with predicate.
+        if (expr.node === '=' && context.dialect.boolPredicatesNotValues) {
+          if (expr.kids.right.node === 'true') {
+            rightSql = 'CAST(1 AS BIT)';
+          } else if (expr.kids.right.node === 'false') {
+            rightSql = 'CAST(0 AS BIT)';
+          }
+          if (expr.kids.left.node === 'true') {
+            leftSql = 'CAST(1 AS BIT)';
+          } else if (expr.kids.left.node === 'false') {
+            leftSql = 'CAST(0 AS BIT)';
+          }
+        }
+        return `${leftSql}${expr.node}${rightSql}`;
+      }
       // Malloy inequality comparisons always return a boolean
       case '!=': {
-        const notEqual = `${expr.kids.left.sql}!=${expr.kids.right.sql}`;
+        let leftSql = expr.kids.left.sql ?? '';
+        let rightSql = expr.kids.right.sql ?? '';
+        if (context.dialect.boolPredicatesNotValues) {
+          if (expr.kids.right.node === 'true') {
+            rightSql = 'CAST(1 AS BIT)';
+          } else if (expr.kids.right.node === 'false') {
+            rightSql = 'CAST(0 AS BIT)';
+          }
+          if (expr.kids.left.node === 'true') {
+            leftSql = 'CAST(1 AS BIT)';
+          } else if (expr.kids.left.node === 'false') {
+            leftSql = 'CAST(0 AS BIT)';
+          }
+        }
+        const notEqual = `${leftSql}!=${rightSql}`;
         return `COALESCE(${notEqual},${context.dialect.sqlBoolean(true)})`;
       }
       case 'and':

@@ -37,6 +37,40 @@ export const MSSQL_MALLOY_STANDARD_OVERLOADS: OverrideMap = {
     'to_integer': {sql: 'ROUND(${value}, 0)'},
     'to_precision': {function: 'ROUND'},
   },
+  // T-SQL ROUND(x, n, 1) truncates instead of rounds.
+  trunc: {
+    'to_integer': {sql: 'ROUND(${value}, 0, 1)'},
+    'to_precision': {sql: 'ROUND(${value}, ${precision}, 1)'},
+  },
+  // T-SQL function name aliases.
+  ceil: {function: 'CEILING'},
+  atan2: {function: 'ATN2'},
+  string_repeat: {function: 'REPLICATE'},
+  ifnull: {function: 'ISNULL'},
+  // T-SQL TRIM with characters uses `TRIM(<chars> FROM <value>)` syntax.
+  trim: {
+    'whitespace': {function: 'TRIM'},
+    'characters': {sql: 'TRIM(${trim_characters} FROM ${value})'},
+  },
+  ltrim: {
+    'whitespace': {function: 'LTRIM'},
+    'characters': {sql: 'LTRIM(${value}, ${trim_characters})'},
+  },
+  rtrim: {
+    'whitespace': {function: 'RTRIM'},
+    'characters': {sql: 'RTRIM(${value}, ${trim_characters})'},
+  },
+  // T-SQL STDEV is sample std-dev (N-1) — matches BigQuery's STDDEV semantics.
+  stddev: {function: 'STDEV'},
+  // T-SQL FLOAT can't represent NaN/Inf; nothing can be NaN/Inf, so return 0.
+  is_nan: {sql: '(0=1)'},
+  is_inf: {sql: '(0=1)'},
+  // T-SQL has no native regex (until SQL Server 2025). REPLACE is literal-only;
+  // pattern-based tests will need to skip until REGEXP_LIKE lands.
+  replace: {
+    'string': {function: 'REPLACE'},
+    'regular_expression': {sql: 'REPLACE(${value}, ${pattern}, ${replacement})'},
+  },
   // No CBRT; use POWER(x, 1.0/3).
   // Trig identities are standard.
 };

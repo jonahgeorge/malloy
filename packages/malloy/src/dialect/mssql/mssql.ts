@@ -67,6 +67,7 @@ const ianaToWindowsTz: Record<string, string> = {
   'Asia/Shanghai': 'China Standard Time',
   'Asia/Kolkata': 'India Standard Time',
   'Australia/Sydney': 'AUS Eastern Standard Time',
+  'Europe/Dublin': 'GMT Standard Time',
 };
 
 function tsqlZone(tz: string): string {
