@@ -483,9 +483,13 @@ export class TestSelect {
         const typedValue = this.toTypedValue(value);
         let sql = this.exprToSQL(typedValue.expr);
         // T-SQL only allows predicates inside CASE/WHERE — booleans here go
-        // straight into a SELECT list and need a value form (BIT). Other
-        // dialects' sqlBoolValueOf is identity, so this is a no-op for them.
-        if (typedValue.malloyType.type === 'boolean') {
+        // straight into a SELECT list and need a value form (BIT). Skip the
+        // wrap when the expression is already a typed value (null cast),
+        // since `sqlBoolValueOf` expects a predicate as input.
+        if (
+          typedValue.malloyType.type === 'boolean' &&
+          !typedValue.needsCast
+        ) {
           sql = this.dialect.sqlBoolValueOf(sql);
         }
 

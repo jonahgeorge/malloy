@@ -259,8 +259,9 @@ function generateSQL(dialect: Dialect, rows: TestDataRow[]): string {
       const typedValue = toTypedValue(value);
       let sql = exprToSQL(typedValue.expr, dialect);
       // SELECT-list booleans need a value form on dialects (T-SQL) where
-      // predicates can't be used as scalar values.
-      if (typedValue.malloyType.type === 'boolean') {
+      // predicates can't be used as scalar values. Skip null casts — they're
+      // already typed values, not predicates.
+      if (typedValue.malloyType.type === 'boolean' && !typedValue.needsCast) {
         sql = dialect.sqlBoolValueOf(sql);
       }
 

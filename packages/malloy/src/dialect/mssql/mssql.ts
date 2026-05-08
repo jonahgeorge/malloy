@@ -173,6 +173,11 @@ export class MSSQLDialect extends Dialect {
         return 'DATETIME2';
       case 'date':
         return 'DATE';
+      // Records and arrays are stored as JSON strings (the dialect emits
+      // JSON_OBJECT/JSON_ARRAY for construction and OPENJSON for unnest).
+      case 'array':
+      case 'record':
+        return 'NVARCHAR(MAX)';
       default:
         return malloyType.type;
     }
@@ -613,16 +618,31 @@ export class MSSQLDialect extends Dialect {
     return sqlType.match(/^[A-Za-z\s(),0-9]*$/) !== null;
   }
 
+  // JSON_ARRAY/JSON_OBJECT take values, so any boolean child predicate
+  // (`(1=1)`/`seats > 0`) needs the BIT-value wrap.
+  private boolValueOfChild(child: {
+    sql?: string;
+    node?: string;
+    typeDef?: {type?: string};
+  }) {
+    const sql = child.sql ?? '';
+    const isBool =
+      child.typeDef?.type === 'boolean' ||
+      child.node === 'true' ||
+      child.node === 'false';
+    return isBool ? this.sqlBoolValueOf(sql) : sql;
+  }
+
   // T-SQL 2022+: JSON_ARRAY and JSON_OBJECT produce JSON strings directly.
   sqlLiteralArray(lit: ArrayLiteralNode): string {
-    const vals = lit.kids.values.map(v => v.sql).join(', ');
+    const vals = lit.kids.values.map(v => this.boolValueOfChild(v)).join(', ');
     return `JSON_ARRAY(${vals})`;
   }
 
   sqlLiteralRecord(lit: RecordLiteralNode): string {
     const pairs = Object.entries(lit.kids).map(
       ([propName, propVal]) =>
-        `${this.sqlLiteralString(propName)}:${propVal.sql}`
+        `${this.sqlLiteralString(propName)}:${this.boolValueOfChild(propVal)}`
     );
     return `JSON_OBJECT(${pairs.join(', ')})`;
   }

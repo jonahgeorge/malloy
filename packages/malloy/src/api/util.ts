@@ -120,6 +120,15 @@ export function mapData(data: QueryData, schema: Malloy.Schema): Malloy.Data {
       }
       return {kind: 'string_cell', string_value: value};
     } else if (field.type.kind === 'array_type') {
+      // Some dialects (T-SQL) have no native array type and round-trip
+      // arrays as JSON strings. Parse on the fly when needed.
+      if (typeof value === 'string') {
+        try {
+          value = JSON.parse(value);
+        } catch {
+          /* fall through to the array check below */
+        }
+      }
       if (!Array.isArray(value)) {
         throw new Error(`Invalid array ${value}`);
       }
@@ -144,6 +153,14 @@ export function mapData(data: QueryData, schema: Malloy.Schema): Malloy.Data {
             value
           )}`
         );
+      }
+      // T-SQL round-trips records as JSON strings — parse them here.
+      if (typeof value === 'string') {
+        try {
+          value = JSON.parse(value);
+        } catch {
+          /* leave as string; mapRow will surface the type mismatch */
+        }
       }
       return mapRow(value as QueryRecord, {
         kind: 'join',

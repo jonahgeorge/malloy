@@ -232,25 +232,11 @@ export class MSSQLConnection
     const pool = await this.getPool();
     const result = await pool.request().query(sql);
     const rows = result.recordset as unknown as QueryData;
-    // Nested aggregations come back as JSON strings (T-SQL has no JSON type).
-    // Best-effort parse: any string cell that starts with `[` or `{` is
-    // attempted as JSON; on parse failure we leave it untouched. This mirrors
-    // the implicit JSON parsing the mysql2 driver does for JSON columns.
-    for (const row of rows) {
-      for (const k of Object.keys(row)) {
-        const v = row[k];
-        if (typeof v === 'string' && v.length > 0) {
-          const c = v.charCodeAt(0);
-          if (c === 0x5b /* [ */ || c === 0x7b /* { */) {
-            try {
-              row[k] = JSON.parse(v);
-            } catch {
-              /* leave as string */
-            }
-          }
-        }
-      }
-    }
+    // Nested aggregations come back as JSON strings (T-SQL has no JSON
+    // type). The schema-aware mapper in `packages/malloy/src/api/util.ts`
+    // parses them when the field type is array/record — so we leave string
+    // values untouched here to avoid corrupting actual NVARCHAR columns
+    // that happen to start with `[` or `{`.
     return {rows, totalRows: rows.length};
   }
 
