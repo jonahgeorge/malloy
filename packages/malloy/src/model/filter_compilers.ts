@@ -71,7 +71,7 @@ export const FilterCompilers = {
     qi: QueryInfo = {}
   ) {
     if (c === null) {
-      return 'true';
+      return d.sqlBoolean(true);
     }
     if (t === 'string' && isStringFilter(c)) {
       return FilterCompilers.stringCompile(c, x, d);
@@ -167,18 +167,18 @@ export const FilterCompilers = {
     if (isColumn) {
       if (bc.operator === 'true') {
         return bc.not
-          ? `${px} IS NULL OR ${px} = false`
+          ? `${px} IS NULL OR ${px} = ${d.sqlBoolean(false)}`
           : `${px} IS NOT NULL AND ${px}`;
       }
       return bc.not
         ? `${px} IS NOT NULL AND ${px}` // not false: exclude null
-        : `${px} IS NULL OR ${px} = false`; // false: include null
+        : `${px} IS NULL OR ${px} = ${d.sqlBoolean(false)}`; // false: include null
     }
     if (bc.operator === 'true') {
-      return bc.not ? `NOT COALESCE(${x}, false)` : `COALESCE(${x}, false)`;
+      return bc.not ? `NOT COALESCE(${x}, ${d.sqlBoolean(false)})` : `COALESCE(${x}, ${d.sqlBoolean(false)})`;
     }
     // else bc.operator === 'false'
-    return bc.not ? `COALESCE(${x}, false)` : `NOT COALESCE(${x}, false)`;
+    return bc.not ? `COALESCE(${x}, ${d.sqlBoolean(false)})` : `NOT COALESCE(${x}, ${d.sqlBoolean(false)})`;
   },
   stringCompile(sc: StringFilter, x: string, d: Dialect): string {
     switch (sc.operator) {
@@ -329,7 +329,7 @@ export const FilterCompilers = {
             ? `(${includeSQL}) AND (${excludeSQL})`
             : includeSQL;
         }
-        return excludeSQL !== '' ? excludeSQL : 'true';
+        return excludeSQL !== '' ? excludeSQL : d.sqlBoolean(true);
       }
     }
   },

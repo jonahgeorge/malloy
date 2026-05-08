@@ -124,6 +124,32 @@ export class FieldInstanceField implements FieldInstance {
     );
   }
 
+  /**
+   * Like generateExpression(), but if the field is a boolean and the dialect
+   * cannot use bare predicates as values (T-SQL), wrap with sqlBoolValueOf.
+   * Use this from SELECT-list / value-context emissions only — predicate
+   * sites (WHERE/HAVING/CASE WHEN/JOIN ON) should keep using
+   * generateExpression() directly.
+   *
+   * NOTE: with `dialect.boolPredicatesNotValues`, expression_compiler
+   * already emits BIT values for boolean operators, so the wrap below is
+   * only triggered for the few code paths that synthesize a raw predicate.
+   */
+  generateValueExpression(): string {
+    const sql = this.generateExpression();
+    const dialect = this.f.parent.dialect;
+    if (
+      dialect.boolPredicatesNotValues &&
+      this.f.fieldDef.type === 'boolean' &&
+      hasExpression(this.f.fieldDef) &&
+      !sql.startsWith('IIF(') &&
+      !sql.startsWith('CAST(')
+    ) {
+      return dialect.sqlBoolValueOf(sql);
+    }
+    return sql;
+  }
+
   private generateDistinctKeyExpression(): string {
     if (this.f.parent.primaryKey()) {
       const pk = this.f.parent.getPrimaryKeyField(this.f.fieldDef);

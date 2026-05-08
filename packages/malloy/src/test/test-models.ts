@@ -257,7 +257,12 @@ function generateSQL(dialect: Dialect, rows: TestDataRow[]): string {
     for (const colName of columnList) {
       const value = row[colName] ?? null;
       const typedValue = toTypedValue(value);
-      const sql = exprToSQL(typedValue.expr, dialect);
+      let sql = exprToSQL(typedValue.expr, dialect);
+      // SELECT-list booleans need a value form on dialects (T-SQL) where
+      // predicates can't be used as scalar values.
+      if (typedValue.malloyType.type === 'boolean') {
+        sql = dialect.sqlBoolValueOf(sql);
+      }
 
       if (idx === 0) {
         // First row: include column aliases and explicit casts if needed
@@ -297,17 +302,16 @@ function generateSQL(dialect: Dialect, rows: TestDataRow[]): string {
     .join(', ');
   const innerQuery = selects.join('\nUNION ALL ');
 
-  // Generate ORDER BY based on dialect preference
-  let orderByClause: string;
-  if (dialect.orderByClause === 'ordinal') {
-    orderByClause = `ORDER BY ${columnList.length + 1}`;
-  } else if (dialect.orderByClause === 'output_name') {
-    orderByClause = `ORDER BY ${rowIdColumn}`;
-  } else {
-    orderByClause = `ORDER BY ${rowIdColumn}`;
-  }
-  // Presto/Trino ignores ORDER BY on a subquery without LIMIT
-  orderByClause += ` LIMIT ${rows.length}`;
+  // Generate ORDER BY through dialect.sqlOrderBy so T-SQL's required
+  // `OFFSET 0 ROWS` suffix is included.
+  const orderTerm =
+    dialect.orderByClause === 'ordinal'
+      ? `${columnList.length + 1}`
+      : rowIdColumn;
+  let orderByClause = dialect.sqlOrderBy([orderTerm], 'query');
+  // Presto/Trino ignores ORDER BY on a subquery without LIMIT.
+  // T-SQL has no LIMIT — sqlLimit produces the dialect-correct form.
+  orderByClause += ` ${dialect.sqlLimit(rows.length, true)}`;
 
   const sql = `SELECT ${quotedColumns}\nFROM (\n  SELECT *\n  FROM (\n${innerQuery}\n  ) AS t_sorted\n  ${orderByClause}\n) AS t_result\n`;
 

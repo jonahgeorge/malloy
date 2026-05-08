@@ -481,7 +481,13 @@ export class TestSelect {
       for (const colName of columnList) {
         const value = row[colName] ?? null;
         const typedValue = this.toTypedValue(value);
-        const sql = this.exprToSQL(typedValue.expr);
+        let sql = this.exprToSQL(typedValue.expr);
+        // T-SQL only allows predicates inside CASE/WHERE — booleans here go
+        // straight into a SELECT list and need a value form (BIT). Other
+        // dialects' sqlBoolValueOf is identity, so this is a no-op for them.
+        if (typedValue.malloyType.type === 'boolean') {
+          sql = this.dialect.sqlBoolValueOf(sql);
+        }
 
         if (idx === 0) {
           // First row: include column aliases and explicit casts if needed
@@ -523,20 +529,17 @@ export class TestSelect {
       .join(', ');
     const innerQuery = selects.join('\nUNION ALL ');
 
-    // Generate ORDER BY based on dialect preference
-    let orderByClause: string;
-    if (this.dialect.orderByClause === 'ordinal') {
-      // ORDER BY position (column count + 1 since row_id is last)
-      orderByClause = `ORDER BY ${columnList.length + 1}`;
-    } else if (this.dialect.orderByClause === 'output_name') {
-      // ORDER BY column name
-      orderByClause = `ORDER BY ${rowIdColumn}`;
-    } else {
-      // ORDER BY expression - just use column name (qualified would be t_sorted.__ts_row_id__)
-      orderByClause = `ORDER BY ${rowIdColumn}`;
-    }
-    // Presto/Trino ignores ORDER BY on a subquery without LIMIT
-    orderByClause += ` LIMIT ${rows.length}`;
+    // Generate ORDER BY based on dialect preference. We go through
+    // dialect.sqlOrderBy so dialects that need extras (T-SQL appends
+    // `OFFSET 0 ROWS` to make pagination legal in subqueries) are honored.
+    const orderTerm =
+      this.dialect.orderByClause === 'ordinal'
+        ? `${columnList.length + 1}`
+        : rowIdColumn;
+    let orderByClause = this.dialect.sqlOrderBy([orderTerm], 'query');
+    // Presto/Trino ignores ORDER BY on a subquery without LIMIT.
+    // T-SQL has no LIMIT — sqlLimit produces the dialect-correct form.
+    orderByClause += ` ${this.dialect.sqlLimit(rows.length, true)}`;
 
     const sql = `SELECT ${quotedColumns}\nFROM (\n  SELECT *\n  FROM (\n${innerQuery}\n  ) AS t_sorted\n  ${orderByClause}\n) AS t_result\n`;
 

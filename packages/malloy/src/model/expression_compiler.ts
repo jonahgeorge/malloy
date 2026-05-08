@@ -221,7 +221,7 @@ function compileExpr<T extends Expr>(
       // Malloy inequality comparisons always return a boolean
       case '!=': {
         const notEqual = `${expr.kids.left.sql}!=${expr.kids.right.sql}`;
-        return `COALESCE(${notEqual},true)`;
+        return `COALESCE(${notEqual},${context.dialect.sqlBoolean(true)})`;
       }
       case 'and':
       case 'or':
@@ -243,13 +243,15 @@ function compileExpr<T extends Expr>(
                 expr.kids.right.literal
               )
             : `${expr.kids.left.sql} ${likeIt} ${expr.kids.right.sql}`;
-        return expr.node === 'like' ? compare : `COALESCE(${compare},true)`;
+        return expr.node === 'like'
+          ? compare
+          : `COALESCE(${compare},${context.dialect.sqlBoolean(true)})`;
       }
       case '()':
         return `(${expr.e.sql})`;
       case 'not':
         // Malloy not operator always returns a boolean
-        return `COALESCE(NOT ${expr.e.sql},TRUE)`;
+        return `COALESCE(NOT ${expr.e.sql},${context.dialect.sqlBoolean(true)})`;
       case 'unary-':
         return `-${expr.e.sql}`;
       case 'is-null':
@@ -262,7 +264,7 @@ function compileExpr<T extends Expr>(
       case 'null':
         return 'NULL';
       case 'case':
-        return generateCaseSQL(expr);
+        return generateCaseSQL(expr, context.dialect);
       case '':
         return '';
       case 'filterCondition':
@@ -1010,18 +1012,31 @@ export function generateSourceReference(
   }
 }
 
-export function generateCaseSQL(pf: CaseExpr): string {
+export function generateCaseSQL(pf: CaseExpr, dialect?: Dialect): string {
+  // For dialects that emit booleans as predicates, the THEN/ELSE positions
+  // are *value* contexts: a bare predicate like `(1=1)` is a syntax error in
+  // T-SQL CASE results. Wrap any bare boolean-literal child with a BIT value.
+  const valueOf = (sql: string | undefined, node: string | undefined) => {
+    if (
+      dialect?.boolPredicatesNotValues &&
+      (node === 'true' || node === 'false')
+    ) {
+      return node === 'true' ? 'CAST(1 AS BIT)' : 'CAST(0 AS BIT)';
+    }
+    return sql;
+  };
   const caseStmt = ['CASE'];
   if (pf.kids.caseValue !== undefined) {
     caseStmt.push(`${pf.kids.caseValue.sql}`);
   }
   for (let i = 0; i < pf.kids.caseWhen.length; i += 1) {
-    caseStmt.push(
-      `WHEN ${pf.kids.caseWhen[i].sql} THEN ${pf.kids.caseThen[i].sql}`
-    );
+    const thenExpr = pf.kids.caseThen[i];
+    const thenSql = valueOf(thenExpr.sql, thenExpr.node);
+    caseStmt.push(`WHEN ${pf.kids.caseWhen[i].sql} THEN ${thenSql}`);
   }
   if (pf.kids.caseElse !== undefined) {
-    caseStmt.push(`ELSE ${pf.kids.caseElse.sql}`);
+    const elseSql = valueOf(pf.kids.caseElse.sql, pf.kids.caseElse.node);
+    caseStmt.push(`ELSE ${elseSql}`);
   }
   caseStmt.push('END');
   return caseStmt.join(' ');

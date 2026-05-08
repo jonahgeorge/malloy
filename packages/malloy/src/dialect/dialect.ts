@@ -221,6 +221,29 @@ export abstract class Dialect {
   // (rather than a position) should set this to true.
   groupByExpression = false;
 
+  // Dialects (e.g. T-SQL) where boolean predicates can appear inside
+  // WHERE/CASE/HAVING/ON but cannot be used as SELECT-list scalar values.
+  // When true, sites that emit a boolean expression as a value wrap with
+  // `sqlBoolValueOf`.
+  boolPredicatesNotValues = false;
+
+  /**
+   * Wrap a predicate (`x > 0`, `(1=1)`, `like`-tests, etc.) into a value
+   * suitable for SELECT lists and other value contexts. Default is identity.
+   */
+  sqlBoolValueOf(predicate: string): string {
+    return predicate;
+  }
+
+  /**
+   * Wrap a boolean *value* (e.g. T-SQL BIT) into a predicate suitable for
+   * WHERE/HAVING/CASE WHEN/JOIN ON. Default is identity — most dialects
+   * already produce predicates for booleans.
+   */
+  sqlBoolPredicateOf(value: string): string {
+    return value;
+  }
+
   // null will match in a function signature
   nullMatchesFunctionSignature = true;
 

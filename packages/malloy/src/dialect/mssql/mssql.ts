@@ -132,10 +132,12 @@ export class MSSQLDialect extends Dialect {
   // already-collapsed CTEs.
   orderByClause: OrderByClauseType = 'ordinal';
   groupByExpression = true;
+  boolPredicatesNotValues = true;
 
-  // T-SQL has no LIMIT — and forbids ORDER BY in a CTE/derived table unless
-  // it's followed by OFFSET/FETCH. We always append `OFFSET 0 ROWS` so an
-  // ORDER BY is legal in any context. `sqlLimit` extends with FETCH NEXT.
+  // T-SQL has no LIMIT. The full pagination clause is
+  // `ORDER BY ... OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`. `sqlOrderBy` for
+  // query-context already appends `OFFSET 0 ROWS`, so when hasOrderBy is
+  // true we only need FETCH; when false we synthesize the whole tail.
   sqlLimit(limit: number, hasOrderBy: boolean): string {
     if (hasOrderBy) {
       return `FETCH NEXT ${limit} ROWS ONLY`;
@@ -197,11 +199,21 @@ export class MSSQLDialect extends Dialect {
   }
 
   // T-SQL doesn't recognize `true`/`false` keywords. Emit a predicate form
-  // (1=1 / 1=0) so the result works inside CASE WHEN, WHERE, HAVING, and ON.
-  // It does not work as a SELECT-list scalar value, but Malloy emits boolean
-  // literals only in predicate positions in practice.
+  // (1=1 / 1=0) — works in WHERE, HAVING, CASE WHEN, and ON. SELECT-list
+  // contexts that need a value wrap separately via `sqlBoolValueOf`.
   sqlBoolean(bv: boolean): string {
     return bv ? '(1=1)' : '(1=0)';
+  }
+
+  // Predicate → BIT value (e.g. for SELECT lists, JSON values).
+  sqlBoolValueOf(predicate: string): string {
+    return `IIF(${predicate}, CAST(1 AS BIT), CAST(0 AS BIT))`;
+  }
+
+  // BIT value → T-SQL predicate (e.g. for WHERE/HAVING). `<> 0` accepts BIT,
+  // INT, and any numeric so it tolerates incidental non-BIT booleans.
+  sqlBoolPredicateOf(value: string): string {
+    return `(${value}) <> 0`;
   }
 
   resultBoolean(bv: boolean) {

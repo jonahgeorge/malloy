@@ -1309,7 +1309,7 @@ export class QueryQuery extends QueryField {
       const fi = field as FieldInstanceField;
       const sqlName = this.parent.dialect.sqlMaybeQuoteIdentifier(name);
       if (fi.fieldUsage.type === 'result') {
-        fields.push(` ${fi.generateExpression()} as ${sqlName}`);
+        fields.push(` ${fi.generateValueExpression()} as ${sqlName}`);
       }
     }
     s += indent(fields.join(',\n')) + '\n';
@@ -1325,7 +1325,9 @@ export class QueryQuery extends QueryField {
         const fi = field as FieldInstanceField;
         if (fi.fieldUsage.type === 'result' && isScalarField(fi.f)) {
           if (useExpr) {
-            const expr = fi.generateExpression();
+            // GROUP BY must match the SELECT-list shape (which uses the value
+            // form for booleans on dialects like T-SQL).
+            const expr = fi.generateValueExpression();
             // Skip pure literals — T-SQL rejects them in GROUP BY.
             if (hasColumnReference(expr)) {
               n.push(expr);
@@ -2084,7 +2086,7 @@ export class QueryQuery extends QueryField {
       ) {
         pushDialectField(dialectFieldList, {
           fieldDef: field.f.fieldDef,
-          sqlExpression: field.generateExpression(),
+          sqlExpression: field.generateValueExpression(),
           rawName: name,
           sqlOutputName: sqlName,
         });
