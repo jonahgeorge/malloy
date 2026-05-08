@@ -221,6 +221,13 @@ export abstract class Dialect {
   // (rather than a position) should set this to true.
   groupByExpression = false;
 
+  // Dialects (T-SQL) that lack a NULLS LAST clause and need an explicit
+  // leading sort term (`CASE WHEN <expr> IS NULL THEN 1 ELSE 0 END ASC`)
+  // to keep nulls at the end on ASC. The model code adds the term using
+  // the field's underlying expression, so it's only applied to scalar
+  // fields where that expression is bindable in ORDER BY.
+  nullsLastWantsFlag = false;
+
   // Dialects (e.g. T-SQL) where boolean predicates can appear inside
   // WHERE/CASE/HAVING/ON but cannot be used as SELECT-list scalar values.
   // When true, sites that emit a boolean expression as a value wrap with

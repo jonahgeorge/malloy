@@ -127,12 +127,13 @@ export class MSSQLDialect extends Dialect {
   supportsArraysInData = true;
   compoundObjectInSchema = false;
   booleanType: BooleanTypeSupport = 'simulated'; // T-SQL has BIT, not BOOLEAN
-  // T-SQL accepts ordinals or output-column aliases in ORDER BY but NOT
-  // arbitrary aggregate expressions referencing inner-stage `base.*` columns.
-  // Use ordinal references so multi-stage queries don't bind back into
-  // already-collapsed CTEs.
+  // T-SQL accepts ordinals or simple aliases in ORDER BY but not arbitrary
+  // expressions when they reference inner-stage column aliases. Use ordinal
+  // mode at this level — the NULL-last emulation in sqlOrderBy uses a
+  // separate path that takes the SELECT-list expression list.
   orderByClause: OrderByClauseType = 'ordinal';
   groupByExpression = true;
+  nullsLastWantsFlag = true;
   boolPredicatesNotValues = true;
 
   // T-SQL has no LIMIT. The full pagination clause is

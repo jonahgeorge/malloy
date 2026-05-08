@@ -1251,20 +1251,42 @@ export class QueryQuery extends QueryField {
 
     const orderBy = queryDef.orderBy || resultStruct.calculateDefaultOrderBy();
     const o: string[] = [];
+    // For dialects without NULLS LAST (T-SQL): add a leading "is null" sort
+    // term that pushes nulls to the end. We only do this when we can write
+    // the underlying expression (scalar fields whose getSQL is a column or
+    // CASE over base columns) — aggregate aliases cannot appear inside
+    // CASE in T-SQL ORDER BY.
+    const dialect = this.parent.dialect;
+    const wantNullLastFlag = dialect.nullsLastWantsFlag;
+    // T-SQL has no NULLS LAST. Add a leading sort term that pushes nulls
+    // to the end. T-SQL won't bind SELECT-list aliases inside CASE in
+    // ORDER BY, so we have to use the underlying expression and only when
+    // it's a simple `[col]` / `<alias>.[col]` reference that resolves in
+    // the FROM scope. Aggregates and complex CASE/CAST expressions keep
+    // T-SQL's default null sort.
+    const simpleColRef = /^[\w]*\.?\[[^\]]+\]$/;
+    const addNullFlag = (fi: FieldInstanceField) => {
+      if (!wantNullLastFlag) return;
+      if (!isScalarField(fi.f)) return;
+      const expr = fi.getSQL();
+      if (!simpleColRef.test(expr.trim())) return;
+      o.push(`CASE WHEN ${expr} IS NULL THEN 1 ELSE 0 END ASC`);
+    };
     for (const f of orderBy) {
       if (typeof f.field === 'string') {
         // convert name to an index
         const fi = resultStruct.getField(f.field);
         if (fi && fi.fieldUsage.type === 'result') {
-          if (this.parent.dialect.orderByClause === 'ordinal') {
+          addNullFlag(fi as FieldInstanceField);
+          if (dialect.orderByClause === 'ordinal') {
             o.push(`${fi.fieldUsage.resultIndex} ${f.dir || 'ASC'}`);
-          } else if (this.parent.dialect.orderByClause === 'output_name') {
+          } else if (dialect.orderByClause === 'output_name') {
             o.push(
-              `${this.parent.dialect.sqlMaybeQuoteIdentifier(f.field)} ${
+              `${dialect.sqlMaybeQuoteIdentifier(f.field)} ${
                 f.dir || 'ASC'
               }`
             );
-          } else if (this.parent.dialect.orderByClause === 'expression') {
+          } else if (dialect.orderByClause === 'expression') {
             const fieldExpr = fi.getSQL();
             o.push(`${fieldExpr} ${f.dir || 'ASC'}`);
           }
@@ -1272,17 +1294,17 @@ export class QueryQuery extends QueryField {
           throw new Error(`Unknown field in ORDER BY ${f.field}`);
         }
       } else {
-        if (this.parent.dialect.orderByClause === 'ordinal') {
+        const orderingField = resultStruct.getFieldByNumber(f.field);
+        addNullFlag(orderingField.fif as FieldInstanceField);
+        if (dialect.orderByClause === 'ordinal') {
           o.push(`${f.field} ${f.dir || 'ASC'}`);
-        } else if (this.parent.dialect.orderByClause === 'output_name') {
-          const orderingField = resultStruct.getFieldByNumber(f.field);
+        } else if (dialect.orderByClause === 'output_name') {
           o.push(
-            `${this.parent.dialect.sqlMaybeQuoteIdentifier(
-              orderingField.name
-            )} ${f.dir || 'ASC'}`
+            `${dialect.sqlMaybeQuoteIdentifier(orderingField.name)} ${
+              f.dir || 'ASC'
+            }`
           );
-        } else if (this.parent.dialect.orderByClause === 'expression') {
-          const orderingField = resultStruct.getFieldByNumber(f.field);
+        } else if (dialect.orderByClause === 'expression') {
           const fieldExpr = orderingField.fif.getSQL();
           o.push(`${fieldExpr} ${f.dir || 'ASC'}`);
         }
