@@ -216,6 +216,11 @@ export abstract class Dialect {
   // ORDER BY 1 DESC
   orderByClause: OrderByClauseType = 'ordinal';
 
+  // T-SQL doesn't accept positional ordinals in GROUP BY — `GROUP BY 1` means
+  // group by the constant 1. Dialects that need the original expression repeated
+  // (rather than a position) should set this to true.
+  groupByExpression = false;
+
   // null will match in a function signature
   nullMatchesFunctionSignature = true;
 
@@ -913,6 +918,15 @@ export abstract class Dialect {
    */
   sqlOrderBy(orderTerms: string[], _orderFor?: OrderByRequest): string {
     return `ORDER BY ${orderTerms.join(',')}`;
+  }
+
+  /**
+   * Render the row-limit clause. Default is the standard `LIMIT N` form.
+   * `hasOrderBy` indicates whether an ORDER BY was already emitted into the
+   * current stage; T-SQL's OFFSET/FETCH form requires one.
+   */
+  sqlLimit(limit: number, _hasOrderBy: boolean): string {
+    return `LIMIT ${limit}`;
   }
 
   sqlTzStr(qi: QueryInfo): string {

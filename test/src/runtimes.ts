@@ -49,6 +49,7 @@ import {
   MySQLExecutor,
 } from '@malloydata/db-mysql/src/mysql_connection';
 import {DatabricksConnection} from '@malloydata/db-databricks/src/databricks_connection';
+import {MSSQLConnection} from '@malloydata/db-mssql/src/mssql_connection';
 import {EventEmitter} from 'events';
 
 export class SnowflakeTestConnection extends SnowflakeConnection {
@@ -225,9 +226,20 @@ export function runtimeFor(dbName: string): SingleConnectionRuntime {
           name: dbName,
           additionalExtensions: ['mssql'],
           setupSQL: [
-            "ATTACH 'Server=localhost;Port=1433;Database=malloytest;User Id=sa;Password=Malloy_Test_123;TrustServerCertificate=true' AS msdb (TYPE mssql)",
+            `ATTACH 'Server=localhost,${process.env['MSSQL_HOST_PORT'] ?? '11433'};Database=malloytest;User Id=sa;Password=Malloy_Test_123;TrustServerCertificate=true' AS msdb (TYPE mssql)`,
             'USE msdb.malloytest',
           ].join(';\n'),
+        });
+        break;
+      case 'mssql':
+        connection = new MSSQLConnection(dbName, {
+          server: process.env['MSSQL_SERVER'] ?? 'localhost',
+          port: Number(process.env['MSSQL_PORT'] ?? '11433'),
+          user: process.env['MSSQL_USER'] ?? 'sa',
+          password: process.env['MSSQL_PASSWORD'] ?? 'Malloy_Test_123',
+          database: process.env['MSSQL_DATABASE'] ?? 'malloytest',
+          encrypt: false,
+          trustServerCertificate: true,
         });
         break;
       case 'motherduck':

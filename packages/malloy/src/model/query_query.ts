@@ -4,6 +4,7 @@
  */
 
 import type {
+  Dialect,
   DialectFieldList,
   CompiledOrderBy,
   LateralJoinExpression,
@@ -85,6 +86,51 @@ import {mkBuildID} from './source_def_utils';
 
 function pathToCol(path: string[]): string {
   return path.map(el => encodeURIComponent(el)).join('/');
+}
+
+// Heuristic: does an expression reference an actual column? T-SQL rejects
+// `GROUP BY <constant-only-expression>`. We strip string literals first so
+// quoted column-like text doesn't fool us, then look for a bracket-quoted
+// identifier ([col]) — Malloy always emits bracketed identifiers for MSSQL
+// column references. Pure literals, arithmetic on literals, and parameter
+// substitutions never produce a `[`.
+function hasColumnReference(expr: string): boolean {
+  // Strip string literals so quoted text can't masquerade as identifiers.
+  const stripped = expr.replace(/'(?:[^']|'')*'/g, '');
+  // Real column references in MSSQL output are bracketed (`[col]` or
+  // `base.[col]`). The lone exception is `group_set`/`GROUP_SET`, which is the
+  // bareword column added by the dialect's CROSS JOIN VALUES table.
+  if (/\[[^\]]*\]/.test(stripped)) return true;
+  return /\bgroup_set\b/i.test(stripped);
+}
+
+// For dialects that disallow positional GROUP BY (e.g. T-SQL), turn a list
+// of 1-based indexes into the corresponding SELECT-list expressions, with the
+// trailing ` as <alias>` stripped. Each entry of `selectSQL` is shaped like
+// "  <expression> as <alias>".
+function groupByClause(
+  dialect: Dialect,
+  indexes: number[],
+  selectSQL: string[]
+): string {
+  if (!dialect.groupByExpression) {
+    return indexes.join(',');
+  }
+  const exprs = indexes
+    .map(i => {
+      const entry = selectSQL[i - 1];
+      // Alias can be \S+ (unquoted), `[...]` (T-SQL), `"..."`, or `\`...\``.
+      const m = entry.match(
+        /^([\s\S]+?)\s+as\s+(?:\[[^\]]*\]|"[^"]*"|`[^`]*`|\S+)\s*$/i
+      );
+      return (m ? m[1] : entry).trim();
+    })
+    // Drop pure literals — T-SQL rejects `GROUP BY <constant>`. A row group
+    // partitioned only by constants collapses to one row anyway, so omitting
+    // the constant from GROUP BY preserves semantics. Heuristic: no `[` or `.`
+    // means no column/path reference (possibly a unicode-prefixed string).
+    .filter(e => hasColumnReference(e));
+  return exprs.join(', ');
 }
 
 interface OutputPipelinedSQL {
@@ -1273,29 +1319,43 @@ export class QueryQuery extends QueryField {
 
     // group by
     if (this.firstSegment.type === 'reduce') {
+      const useExpr = this.parent.dialect.groupByExpression;
       const n: string[] = [];
       for (const field of this.rootResult.fields()) {
         const fi = field as FieldInstanceField;
         if (fi.fieldUsage.type === 'result' && isScalarField(fi.f)) {
-          n.push(fi.fieldUsage.resultIndex.toString());
+          if (useExpr) {
+            const expr = fi.generateExpression();
+            // Skip pure literals — T-SQL rejects them in GROUP BY.
+            if (hasColumnReference(expr)) {
+              n.push(expr);
+            }
+          } else {
+            n.push(fi.fieldUsage.resultIndex.toString());
+          }
         }
       }
       if (n.length > 0) {
-        s += `GROUP BY ${n.join(',')}\n`;
+        s += `GROUP BY ${n.join(useExpr ? ', ' : ',')}\n`;
       }
     }
 
     s += this.generateSQLFilters(this.rootResult, 'having').sql('having');
 
     // order by
-    s += this.genereateSQLOrderBy(
+    const orderBySql = this.genereateSQLOrderBy(
       this.firstSegment as QuerySegment,
       this.rootResult
     );
+    s += orderBySql;
 
     // limit
     if (!isRawSegment(this.firstSegment) && this.firstSegment.limit) {
-      s += `LIMIT ${this.firstSegment.limit}\n`;
+      s +=
+        this.parent.dialect.sqlLimit(
+          this.firstSegment.limit,
+          orderBySql.length > 0
+        ) + '\n';
     }
     this.resultStage = stageWriter.addStage(s);
     return this.resultStage;
@@ -1689,7 +1749,10 @@ export class QueryQuery extends QueryField {
       throw new Error('PROJECT cannot be used on queries with turtles');
     }
 
-    const groupBy = 'GROUP BY ' + f.dimensionIndexes.join(',') + '\n';
+    const groupBy =
+      'GROUP BY ' +
+      groupByClause(this.parent.dialect, f.dimensionIndexes, f.sql) +
+      '\n';
 
     from += this.parent.dialect.sqlGroupSetTable(this.maxGroupSet) + '\n';
 
@@ -1825,7 +1888,11 @@ export class QueryQuery extends QueryField {
       s += `WHERE ${where}\n`;
     }
     if (f.dimensionIndexes.length > 0) {
-      s += `GROUP BY ${f.dimensionIndexes.join(',')}\n`;
+      s += `GROUP BY ${groupByClause(
+        this.parent.dialect,
+        f.dimensionIndexes,
+        f.sql
+      )}\n`;
     }
 
     this.resultStage = stageWriter.addStage(s);
@@ -1916,18 +1983,27 @@ export class QueryQuery extends QueryField {
     }
 
     if (dimensionIndexes.length > 0) {
-      s += `GROUP BY ${dimensionIndexes.join(',')}\n`;
+      s += `GROUP BY ${groupByClause(
+        this.parent.dialect,
+        dimensionIndexes,
+        fieldsSQL
+      )}\n`;
     }
 
     // order by
-    s += this.genereateSQLOrderBy(
+    const orderBySql = this.genereateSQLOrderBy(
       this.firstSegment as QuerySegment,
       this.rootResult
     );
+    s += orderBySql;
 
     // limit
     if (!isRawSegment(this.firstSegment) && this.firstSegment.limit) {
-      s += `LIMIT ${this.firstSegment.limit}\n`;
+      s +=
+        this.parent.dialect.sqlLimit(
+          this.firstSegment.limit,
+          orderBySql.length > 0
+        ) + '\n';
     }
 
     this.resultStage = stageWriter.addStage(s);
@@ -2339,32 +2415,38 @@ class QueryQueryIndexStage extends QueryQuery {
 
     let s = 'SELECT\n  group_set,\n';
 
-    s += '  CASE group_set\n';
+    let nameCase = '  CASE group_set\n';
     for (let i = 0; i < fields.length; i++) {
-      s += `    WHEN ${i} THEN '${fields[i].name}'\n`;
+      nameCase += `    WHEN ${i} THEN '${fields[i].name}'\n`;
     }
-    s += `  END as ${fieldNameColumn},\n`;
+    nameCase += '  END';
+    s += `${nameCase} as ${fieldNameColumn},\n`;
 
-    s += '  CASE group_set\n';
+    let pathCase = '  CASE group_set\n';
     for (let i = 0; i < fields.length; i++) {
       const path = pathToCol(fields[i].path);
-      s += `    WHEN ${i} THEN '${path}'\n`;
+      pathCase += `    WHEN ${i} THEN '${path}'\n`;
     }
-    s += `  END as ${fieldPathColumn},\n`;
+    pathCase += '  END';
+    s += `${pathCase} as ${fieldPathColumn},\n`;
 
-    s += '  CASE group_set\n';
+    let typeCase = '  CASE group_set\n';
     for (let i = 0; i < fields.length; i++) {
-      s += `    WHEN ${i} THEN '${fields[i].type}'\n`;
+      typeCase += `    WHEN ${i} THEN '${fields[i].type}'\n`;
     }
-    s += `  END as ${fieldTypeColumn},`;
+    typeCase += '  END';
+    s += `${typeCase} as ${fieldTypeColumn},`;
 
-    s += `  CASE group_set WHEN 99999 THEN ${dialect.castToString('NULL')}\n`;
+    let valueCase = `  CASE group_set WHEN 99999 THEN ${dialect.castToString(
+      'NULL'
+    )}\n`;
     for (let i = 0; i < fields.length; i++) {
       if (fields[i].type === 'string') {
-        s += `    WHEN ${i} THEN ${fields[i].expression}\n`;
+        valueCase += `    WHEN ${i} THEN ${fields[i].expression}\n`;
       }
     }
-    s += `  END as ${fieldValueColumn},\n`;
+    valueCase += '  END';
+    s += `${valueCase} as ${fieldValueColumn},\n`;
 
     s += ` ${measureSQL} as ${weightColumn},\n`;
 
@@ -2402,11 +2484,15 @@ class QueryQueryIndexStage extends QueryQuery {
 
     s += this.generateSQLFilters(this.rootResult, 'where').sql('where');
 
-    s += 'GROUP BY 1,2,3,4,5\n';
+    if (dialect.groupByExpression) {
+      s += `GROUP BY group_set, ${nameCase}, ${pathCase}, ${typeCase}, ${valueCase}\n`;
+    } else {
+      s += 'GROUP BY 1,2,3,4,5\n';
+    }
 
     // limit
     if (!isRawSegment(this.firstSegment) && this.firstSegment.limit) {
-      s += `LIMIT ${this.firstSegment.limit}\n`;
+      s += dialect.sqlLimit(this.firstSegment.limit, false) + '\n';
     }
     // console.log(s);
     const resultStage = stageWriter.addStage(s);

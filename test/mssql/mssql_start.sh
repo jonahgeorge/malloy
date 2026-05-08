@@ -7,6 +7,7 @@ DUCKDBDIR=$(dirname $SCRIPTDIR)/data/duckdb
 CONTAINER_NAME="mssql-malloy"
 SA_PASSWORD="Malloy_Test_123"
 DB_NAME="malloytest"
+HOST_PORT="${MSSQL_HOST_PORT:-11433}"
 
 # Require duckdb CLI (used for readiness check and data loading)
 if ! command -v duckdb > /dev/null 2>&1; then
@@ -24,36 +25,39 @@ if docker container inspect "$CONTAINER_NAME" > /dev/null 2>&1; then
   docker start "$CONTAINER_NAME"
   echo -n "Waiting for MSSQL..."
   for i in $(seq 1 60); do
-    duckdb -c "LOAD mssql; ATTACH 'Server=localhost;Port=1433;Database=master;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS _ping (TYPE mssql);" > /dev/null 2>&1 && break
+    duckdb -c "LOAD mssql; ATTACH 'Server=localhost,$HOST_PORT;Database=master;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS _ping (TYPE mssql);" > /dev/null 2>&1 && break
     echo -n "."
     sleep 2
   done
   echo " ready"
-  echo "MSSQL running on port 1433"
+  echo "MSSQL running on port $HOST_PORT"
   exit 0
 fi
 
-# Detect architecture — Azure SQL Edge for ARM64, SQL Server for x64
+# Always use SQL Server 2022 — the dialect targets T-SQL 2022 features
+# (JSON_OBJECT, JSON_ARRAY, DATEDIFF_BIG). Azure SQL Edge is ARM-native but
+# lacks those JSON functions, so on ARM64 Macs we emulate amd64.
+IMAGE="mcr.microsoft.com/mssql/server:2022-latest"
 ARCH=$(uname -m)
+PLATFORM_FLAG=""
 if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
-  IMAGE="mcr.microsoft.com/azure-sql-edge:latest"
-else
-  IMAGE="mcr.microsoft.com/mssql/server:2022-latest"
+  PLATFORM_FLAG="--platform=linux/amd64"
 fi
 
-echo "Starting $CONTAINER_NAME ($IMAGE)..."
+echo "Starting $CONTAINER_NAME ($IMAGE $PLATFORM_FLAG)..."
 docker run -d \
   --name "$CONTAINER_NAME" \
+  $PLATFORM_FLAG \
   -e "ACCEPT_EULA=Y" \
   -e "MSSQL_SA_PASSWORD=$SA_PASSWORD" \
-  -p 1433:1433 \
+  -p $HOST_PORT:1433 \
   "$IMAGE"
 
 # Wait for server to accept connections (check via DuckDB mssql extension)
 counter=0
 echo -n "Waiting for MSSQL..."
 while true; do
-  duckdb -c "LOAD mssql; ATTACH 'Server=localhost;Port=1433;Database=master;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS _ping (TYPE mssql);" > /dev/null 2>&1 && break
+  duckdb -c "LOAD mssql; ATTACH 'Server=localhost,$HOST_PORT;Database=master;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS _ping (TYPE mssql);" > /dev/null 2>&1 && break
   counter=$((counter + 1))
   if [ $counter -ge 60 ]; then
     echo
@@ -73,13 +77,13 @@ duckdb -c "
 LOAD mssql;
 
 -- Create database
-ATTACH 'Server=localhost;Port=1433;Database=master;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS msdb (TYPE mssql);
+ATTACH 'Server=localhost,$HOST_PORT;Database=master;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS msdb (TYPE mssql);
 SELECT mssql_exec('msdb', 'IF DB_ID(''$DB_NAME'') IS NOT NULL DROP DATABASE $DB_NAME');
 SELECT mssql_exec('msdb', 'CREATE DATABASE $DB_NAME');
 DETACH msdb;
 
 -- Connect to test database
-ATTACH 'Server=localhost;Port=1433;Database=$DB_NAME;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS msdb (TYPE mssql);
+ATTACH 'Server=localhost,$HOST_PORT;Database=$DB_NAME;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true' AS msdb (TYPE mssql);
 
 -- Create malloytest schema so table paths (malloytest.flights etc.) match DuckDB tests
 SELECT mssql_exec('msdb', 'CREATE SCHEMA malloytest');
@@ -178,5 +182,5 @@ UNION ALL SELECT 'alltypes', COUNT(*) FROM msdb.malloytest.alltypes;
 "
 
 echo
-echo "MSSQL running on port 1433, database: $DB_NAME"
-echo "  Connection: Server=localhost;Port=1433;Database=$DB_NAME;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true"
+echo "MSSQL running on port $HOST_PORT, database: $DB_NAME"
+echo "  Connection: Server=localhost,$HOST_PORT;Database=$DB_NAME;User Id=sa;Password=$SA_PASSWORD;TrustServerCertificate=true"

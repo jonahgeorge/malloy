@@ -137,6 +137,11 @@ const config: Config = {
       displayName: 'db-databricks',
       roots: ['<rootDir>/packages/malloy-db-databricks/'],
     },
+    {
+      ...defaultConfig,
+      displayName: 'db-mssql',
+      roots: ['<rootDir>/packages/malloy-db-mssql/'],
+    },
   ],
 };
 
