@@ -874,6 +874,30 @@ runtimes.runtimeMap.forEach((runtime, databaseName) => {
       `).toMatchPaths(testModel, {'all_c': 2421});
   });
 
+  // Same bug as `ungrouped + pick on group-by'd column`, but triggered
+  // via `exclude()` instead of `all()`. The exclude widens the GROUP BY
+  // for cols *other than* the excluded one, so the GROUP BY entry for
+  // a kept col is `CASE WHEN group_set IN (mainGroup, excludeGroup) THEN
+  // <col> END` — not the single-group shape the previous fix produced.
+  // The non-aggregate ref inside the measure needs to use the kept col's
+  // *additional group sets* too, otherwise it doesn't syntactically match
+  // the GROUP BY entry and T-SQL still rejects with Msg 8120.
+  it(`exclude + pick on kept group-by'd column - ${databaseName}`, async () => {
+    const testModel = wrapTestModel(runtime, '');
+    await expect(`
+        run: ${databaseName}.table('malloytest.airports') extend {
+          measure: c is count()
+        } -> {
+          where: state = 'TX' | 'NY'
+          group_by: state, fac_type
+          aggregate:
+            c
+            broadcast_c is exclude(c, fac_type)
+            tx_zero is pick 0 when state = 'TX' else c
+        }
+      `).toMatchPaths(testModel, {'state': 'TX', 'broadcast_c': 1845});
+  });
+
   test.when(runtime.supportsNesting)(
     `ungrouped - all nested - ${databaseName}`,
     async () => {

@@ -42,8 +42,8 @@ import {
 } from '@malloydata/malloy-filter';
 import {
   sqlFullChildReference,
+  FieldInstanceField,
   type FieldInstanceResult,
-  type FieldInstanceField,
   type UngroupSet,
 } from './field_instance';
 import {FilterCompilers} from './filter_compilers';
@@ -846,20 +846,67 @@ export function generateFieldFragment(
     // Strict-GROUP-BY dialects (T-SQL/MSSQL): a non-aggregate column ref
     // inside a measure's outer SELECT-list expression must syntactically
     // match the GROUP BY entry, which `FieldInstanceField.getSQL()` shaped
-    // as `CASE WHEN group_set IN (childGroups) THEN <col> END` whenever
-    // ungroup-introduced compute-only group sets push the result's
-    // groupSet above 0. Mirror that wrap here so `pick … when <col> = …`
-    // and similar non-aggregate sub-expressions reference the same shape.
+    // as `CASE WHEN group_set IN (childGroups + additionalGroupSets) THEN
+    // <col> END` whenever ungroup-introduced compute-only group sets push
+    // the result's groupSet above 0. Mirror that wrap here so `pick …
+    // when <col> = …` and similar non-aggregate sub-expressions reference
+    // the same shape. `additionalGroupSets` is per-field — populated for
+    // each `exclude(<other-fields>)` set the field is kept in. Look up
+    // the matching FieldInstanceField if it's a result-level scalar so
+    // we pick up those extra group sets; fall back to childGroups alone
+    // (the `all()` shape) if the ref doesn't correspond to a result
+    // field (e.g. inside aggregates we already cleared inMeasureSelect,
+    // but a measure expression can still reference a non-grouped col).
     if (
       state.inMeasureSelect &&
       context.dialect.strictGroupByReferences &&
       resultSet.root().isComplexQuery &&
       resultSet.groupSet > 0
     ) {
-      return caseGroup(resultSet.childGroups, sql);
+      let groupSets: number[] = resultSet.childGroups;
+      const fi = findResultScalarField(resultSet, fieldRef);
+      if (fi !== undefined && fi.additionalGroupSets.length > 0) {
+        groupSets = groupSets.concat(fi.additionalGroupSets);
+      }
+      return caseGroup(groupSets, sql);
     }
     return sql;
   }
+}
+
+// Find the FieldInstanceField in `resultSet` (or any ancestor) that
+// corresponds to `fieldRef` — i.e. the result-level scalar that the SQL
+// ref points at. Used to recover the field's `additionalGroupSets` so
+// the strict-GROUP-BY wrap matches the GROUP BY's expression shape under
+// `exclude(...)`. Returns undefined for refs that aren't result fields
+// (no extra group sets to apply).
+function findResultScalarField(
+  resultSet: FieldInstanceResult,
+  fieldRef: QueryField
+): FieldInstanceField | undefined {
+  // The QueryField from `context.getFieldByName(path)` may be a different
+  // instance than the one stored on the matching FieldInstanceField (the
+  // resolver builds query-field wrappers; the result builds its own).
+  // Match by the field's identifier (the result-set output name) since
+  // that's what `assignFieldsToGroups` keys off of too.
+  const targetName = fieldRef.getIdentifier();
+  let r: FieldInstanceResult | undefined = resultSet;
+  while (r !== undefined) {
+    for (const [name, fi] of r.allFields) {
+      if (
+        fi instanceof FieldInstanceField &&
+        fi.fieldUsage.type === 'result' &&
+        (fi.f === fieldRef ||
+          fi.f.fieldDef === fieldRef.fieldDef ||
+          name === targetName ||
+          fi.f.getIdentifier() === targetName)
+      ) {
+        return fi;
+      }
+    }
+    r = r.parent;
+  }
+  return undefined;
 }
 
 export function generateOutputFieldFragment(
