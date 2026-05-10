@@ -74,6 +74,34 @@ function tsqlZone(tz: string): string {
   return ianaToWindowsTz[tz] ?? tz;
 }
 
+// Strip a trailing ` as <alias>` from a SELECT-list entry shaped like
+// "  <expression> as <alias>". The alias may be unquoted, bracketed
+// (T-SQL), double-quoted, or backticked.
+function stripSelectAlias(entry: string): string {
+  const m = entry.match(
+    /^([\s\S]+?)\s+as\s+(?:\[[^\]]*\]|"[^"]*"|`[^`]*`|\S+)\s*$/i
+  );
+  return (m ? m[1] : entry).trim();
+}
+
+// Heuristic: does an expression reference an actual column? T-SQL rejects
+// `GROUP BY <constant-only-expression>`. Strip string literals first so
+// quoted column-like text doesn't fool us, then look for a bracket-quoted
+// identifier ([col]) — Malloy always emits bracketed identifiers for MSSQL
+// column references. Pure literals, arithmetic on literals, and parameter
+// substitutions never produce a `[`. The lone exception is `group_set`,
+// the bareword column added by the dialect's CROSS JOIN VALUES table.
+function hasColumnReference(expr: string): boolean {
+  const stripped = expr.replace(/'(?:[^']|'')*'/g, '');
+  if (/\[[^\]]*\]/.test(stripped)) return true;
+  return /\bgroup_set\b/i.test(stripped);
+}
+
+// Simple `[col]` or `<alias>.[col]` reference. Used to gate the NULLS-LAST
+// flag emission, since T-SQL won't bind aliases or aggregates inside CASE
+// in ORDER BY.
+const simpleColRef = /^[\w]*\.?\[[^\]]+\]$/;
+
 const mssqlToMalloyTypes: {[key: string]: BasicAtomicTypeDef} = {
   'bit': {type: 'boolean'},
   'tinyint': {type: 'number', numberType: 'integer'},
@@ -132,9 +160,36 @@ export class MSSQLDialect extends Dialect {
   // mode at this level — the NULL-last emulation in sqlOrderBy uses a
   // separate path that takes the SELECT-list expression list.
   orderByClause: OrderByClauseType = 'ordinal';
-  groupByExpression = true;
-  nullsLastWantsFlag = true;
   boolPredicatesNotValues = true;
+
+  // T-SQL rejects positional ordinals in GROUP BY (`GROUP BY 1` groups by
+  // the constant 1) and rejects pure literals there too. Re-emit the
+  // SELECT-list expressions with their `as <alias>` tail stripped, and drop
+  // any expression that has no column reference.
+  sqlGroupBy(indexes: number[], selectExpressions: string[]): string {
+    const exprs = indexes
+      .map(i => stripSelectAlias(selectExpressions[i - 1]))
+      .filter(expr => hasColumnReference(expr));
+    return exprs.join(', ');
+  }
+
+  // T-SQL has no NULLS LAST keyword. We can't reference SELECT-list aliases
+  // inside CASE in ORDER BY (T-SQL refuses to bind them, even for simple
+  // renames), so the flag term is only useful when the field's underlying
+  // expression is a simple `[col]` or `<alias>.[col]` reference that
+  // resolves in the FROM scope. Aggregates / complex CASE/CAST expressions
+  // skip the flag and inherit T-SQL's default null sort.
+  sqlOrderByNullFlag(fieldExpr: string): string | undefined {
+    if (!simpleColRef.test(fieldExpr.trim())) return undefined;
+    return `CASE WHEN ${fieldExpr} IS NULL THEN 1 ELSE 0 END ASC`;
+  }
+
+  // T-SQL's BIT value form for boolean literals — used in any context that
+  // needs a value rather than a predicate (comparison RHS, CASE THEN/ELSE,
+  // JSON values).
+  sqlBoolLiteralValue(literal: 'true' | 'false'): string {
+    return literal === 'true' ? 'CAST(1 AS BIT)' : 'CAST(0 AS BIT)';
+  }
 
   // T-SQL has no LIMIT. The full pagination clause is
   // `ORDER BY ... OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`. `sqlOrderBy` for
@@ -194,11 +249,30 @@ export class MSSQLDialect extends Dialect {
     );
   }
 
+  // When true, table references in compiled SQL get a `(NOLOCK)` hint
+  // appended (read-uncommitted, no shared locks). Useful for warehouse /
+  // reporting queries against an OLTP source where you don't want the
+  // analytical query to block writers (or be blocked by them). Defaults
+  // to false; toggle on the registered dialect singleton:
+  //   (getDialect('mssql') as MSSQLDialect).useNolockHints = true;
+  //
+  // Note: T-SQL syntactically requires the modern `WITH (NOLOCK)` form to
+  // appear *after* the table alias (`FROM [tbl] AS x WITH (NOLOCK)`), but
+  // Malloy's core composes `<table> as <alias>` with the alias appended by
+  // the caller — leaving the dialect no clean way to inject after the
+  // alias. We use the older bare-parenthesis `(NOLOCK)` form, which is
+  // accepted before the alias (`FROM [tbl] (NOLOCK) as x`). This form is
+  // marked "deprecated" in Microsoft's docs but remains functional through
+  // SQL Server 2022 and is the only path that survives Malloy's emission
+  // shape today.
+  useNolockHints = false;
+
   quoteTablePath(tablePath: string): string {
-    return tablePath
+    const quoted = tablePath
       .split('.')
       .map(part => this.sqlMaybeQuoteIdentifier(part))
       .join('.');
+    return this.useNolockHints ? `${quoted} (NOLOCK)` : quoted;
   }
 
   sqlMaybeQuoteIdentifier(identifier: string): string {
@@ -213,14 +287,66 @@ export class MSSQLDialect extends Dialect {
   }
 
   // Predicate → BIT value (e.g. for SELECT lists, JSON values).
+  // Idempotent: if the input is already a value-shaped expression — a bare
+  // BIT column reference, an existing CAST/IIF, or NULL — leave it alone.
+  // T-SQL's IIF rejects a BIT column as its first arg ("non-boolean type
+  // specified in a context where a condition is expected"), so wrapping a
+  // BIT value with IIF would produce invalid SQL.
   sqlBoolValueOf(predicate: string): string {
+    const trimmed = predicate.trim();
+    if (
+      simpleColRef.test(trimmed) ||
+      trimmed.startsWith('CAST(') ||
+      trimmed.startsWith('IIF(') ||
+      trimmed === 'NULL'
+    ) {
+      return predicate;
+    }
     return `IIF(${predicate}, CAST(1 AS BIT), CAST(0 AS BIT))`;
   }
 
-  // BIT value → T-SQL predicate (e.g. for WHERE/HAVING). `<> 0` accepts BIT,
-  // INT, and any numeric so it tolerates incidental non-BIT booleans.
+  // T-SQL rejects `COALESCE(<predicate>, ...)` at parse time — COALESCE
+  // strictly takes value arguments. Emit a null-safe inequality predicate
+  // by adding explicit `IS NULL` arms instead.
+  sqlNullSafeNotEq(leftSql: string, rightSql: string): string {
+    return `(${leftSql} IS NULL OR ${rightSql} IS NULL OR ${leftSql}!=${rightSql})`;
+  }
+
+  // T-SQL rejects both `NOT <bit>` (NOT requires a predicate) and
+  // `COALESCE(<predicate>, ...)`. Promote the inner expression to a BIT
+  // value, COALESCE with the false-default (so NULL → "not"-true), and
+  // re-test as a predicate. `sqlBoolValueOf` is idempotent: BIT-shaped
+  // inputs (column ref, CAST, IIF) pass through; predicate inputs get
+  // wrapped with IIF.
+  sqlNullSafeNot(innerSql: string): string {
+    const value = this.sqlBoolValueOf(innerSql);
+    return `(COALESCE(${value},CAST(0 AS BIT))=CAST(0 AS BIT))`;
+  }
+
+  // T-SQL rejects `COALESCE(<predicate>, ...)`. Right-hand side of LIKE is
+  // typically a string literal (can't be NULL); only the left needs an
+  // explicit IS NULL arm.
+  sqlNullSafeNotLike(compareSql: string, leftSql: string): string {
+    return `(${leftSql} IS NULL OR ${compareSql})`;
+  }
+
+  // BIT value → T-SQL predicate (e.g. for WHERE/HAVING/AND/OR/NOT contexts).
+  // Idempotent: if the input already looks like a predicate (a comparison,
+  // logical operator, IS NULL test, LIKE, IN, etc.), return it unchanged so
+  // we don't produce `<predicate> <> 0` which is invalid in T-SQL.
   sqlBoolPredicateOf(value: string): string {
-    return `(${value}) <> 0`;
+    const trimmed = value.trim();
+    // BIT-shaped values that need promotion: simple column ref, CAST, IIF,
+    // NULL. Anything else is assumed to already be a predicate.
+    if (
+      simpleColRef.test(trimmed) ||
+      trimmed.startsWith('CAST(') ||
+      trimmed.startsWith('IIF(') ||
+      trimmed === 'NULL'
+    ) {
+      return `(${value}<>CAST(0 AS BIT))`;
+    }
+    return value;
   }
 
   resultBoolean(bv: boolean) {
@@ -589,8 +715,18 @@ export class MSSQLDialect extends Dialect {
   }
 
   sqlLiteralString(literal: string): string {
-    // N'...' for unicode-safe string literals; '' escapes single quotes.
-    return "N'" + literal.replace(/'/g, "''") + "'";
+    // Use the NVARCHAR `N'...'` form only when the literal actually contains
+    // non-ASCII characters. For ASCII-only literals, plain `'...'` is the
+    // safer default in T-SQL: comparing `varchar_col = N'lit'` forces a
+    // per-row implicit conversion of the column (and trips the optimizer's
+    // "PlanAffectingConvert / Cardinality Estimate" warning), while
+    // comparing `nvarchar_col = 'lit'` promotes the literal once at compile
+    // time and keeps stats accurate. The N prefix is only required to
+    // preserve characters that ASCII can't represent.
+    // eslint-disable-next-line no-control-regex
+    const needsUnicode = /[^\x00-\x7F]/.test(literal);
+    const escaped = literal.replace(/'/g, "''");
+    return needsUnicode ? `N'${escaped}'` : `'${escaped}'`;
   }
 
   sqlLiteralRegexp(literal: string): string {

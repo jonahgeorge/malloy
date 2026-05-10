@@ -29,6 +29,7 @@ export {
   MySQLDialect,
   MSSQLDialect,
   DatabricksDialect,
+  getDialect,
   registerDialect,
   arg,
   qtz,

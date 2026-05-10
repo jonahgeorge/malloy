@@ -216,22 +216,20 @@ export abstract class Dialect {
   // ORDER BY 1 DESC
   orderByClause: OrderByClauseType = 'ordinal';
 
-  // T-SQL doesn't accept positional ordinals in GROUP BY — `GROUP BY 1` means
-  // group by the constant 1. Dialects that need the original expression repeated
-  // (rather than a position) should set this to true.
-  groupByExpression = false;
-
-  // Dialects (T-SQL) that lack a NULLS LAST clause and need an explicit
-  // leading sort term (`CASE WHEN <expr> IS NULL THEN 1 ELSE 0 END ASC`)
-  // to keep nulls at the end on ASC. The model code adds the term using
-  // the field's underlying expression, so it's only applied to scalar
-  // fields where that expression is bindable in ORDER BY.
-  nullsLastWantsFlag = false;
-
-  // Dialects (e.g. T-SQL) where boolean predicates can appear inside
-  // WHERE/CASE/HAVING/ON but cannot be used as SELECT-list scalar values.
-  // When true, sites that emit a boolean expression as a value wrap with
-  // `sqlBoolValueOf`.
+  // Dialects where boolean predicates can appear inside WHERE/CASE/HAVING/ON
+  // but cannot be used as SELECT-list scalar values. When true, sites that
+  // emit a boolean expression as a value wrap with `sqlBoolValueOf`, and
+  // boolean *literals* in value contexts route through `sqlBoolLiteralValue`.
+  //
+  // This is a real category, not just a T-SQL quirk:
+  //   - SQL Server / Sybase ASE — BIT, no BOOLEAN.
+  //   - Oracle — no SQL-level BOOLEAN at all (PL/SQL only). `SELECT (x>0)`
+  //     is a syntax error.
+  //   - DB2 LUW before 11.1 (2016) — added BOOLEAN in 11.1.
+  //
+  // None of those dialects ship in Malloy today, so MSSQL is currently the
+  // only consumer of this flag and its companion hooks. Keep the abstraction
+  // in place if/when an Oracle or Sybase dialect lands.
   boolPredicatesNotValues = false;
 
   /**
@@ -249,6 +247,66 @@ export abstract class Dialect {
    */
   sqlBoolPredicateOf(value: string): string {
     return value;
+  }
+
+  /**
+   * Render the comma-separated GROUP BY tail. Default uses positional
+   * ordinals (`1,2,3`); dialects that reject ordinals (T-SQL) override to
+   * re-emit the SELECT-list expressions instead. `selectExpressions[i]` is
+   * the SELECT-list entry for ordinal `i+1` (typically " <expr> as <alias>").
+   */
+  sqlGroupBy(indexes: number[], _selectExpressions: string[]): string {
+    return indexes.join(',');
+  }
+
+  /**
+   * For dialects without a `NULLS LAST` clause (T-SQL), return a leading
+   * ORDER BY term that pushes nulls to the end. `fieldExpr` is the raw SQL
+   * for the sort target. Default is `undefined` (no extra term).
+   */
+  sqlOrderByNullFlag(_fieldExpr: string): string | undefined {
+    return undefined;
+  }
+
+  /**
+   * Render `a != b` so that NULL on either side compiles to `true` (Malloy's
+   * inequality is null-safe). Default emits `COALESCE(a!=b, true)`. T-SQL
+   * rejects predicate arguments to COALESCE, so override to use the
+   * `<x IS NULL OR ...>` form.
+   */
+  sqlNullSafeNotEq(leftSql: string, rightSql: string): string {
+    return `COALESCE(${leftSql}!=${rightSql},${this.sqlBoolean(true)})`;
+  }
+
+  /**
+   * Render `not <expr>` so that a NULL operand compiles to `true`. Default
+   * emits `COALESCE(NOT <expr>, true)`. T-SQL rejects both `NOT <bit>` (NOT
+   * requires a predicate) and `COALESCE(<predicate>, ...)`; override to
+   * promote `<expr>` to a value, COALESCE with the false-default, and
+   * test for zero.
+   */
+  sqlNullSafeNot(innerSql: string): string {
+    return `COALESCE(NOT ${innerSql},${this.sqlBoolean(true)})`;
+  }
+
+  /**
+   * Render `a !like b` (already compiled to `<compareSql>`) so that NULL on
+   * the left compiles to `true`. Default emits `COALESCE(<compareSql>, true)`.
+   * T-SQL override uses `<leftSql IS NULL OR compareSql>`.
+   */
+  sqlNullSafeNotLike(compareSql: string, leftSql: string): string {
+    return `COALESCE(${compareSql},${this.sqlBoolean(true)})`;
+  }
+
+  /**
+   * For dialects (T-SQL) where a boolean literal AST node would otherwise
+   * compile to a predicate (`(1=1)`) but the surrounding context — a
+   * comparison RHS, a CASE THEN/ELSE, a JSON value — needs a *value*
+   * (BIT). Default is `undefined`, meaning the standard `sqlBoolean` form
+   * is used. Override to return a CAST/IIF value form.
+   */
+  sqlBoolLiteralValue(_literal: 'true' | 'false'): string | undefined {
+    return undefined;
   }
 
   // null will match in a function signature

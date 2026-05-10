@@ -92,6 +92,19 @@ Approach taken (commits 40c1136, 0f085fc):
 - `MSSQLDialect.sqlBoolValueOf(predicate)` → `IIF(<pred>, CAST(1 AS BIT), CAST(0 AS BIT))`
   — wraps a predicate into a BIT value.
 - `Dialect.boolPredicatesNotValues` flag — MSSQL: true.
+- `Dialect.sqlBoolLiteralValue('true' | 'false')` — for dialects where a bare
+  boolean literal AST node compiles to a predicate (`(1=1)`) but the
+  surrounding context (comparison RHS, CASE THEN/ELSE) needs a value
+  (BIT). Default returns undefined; MSSQL returns `CAST(1/0 AS BIT)`.
+
+The `boolPredicatesNotValues` flag and its companion hooks
+(`sqlBoolValueOf`, `sqlBoolPredicateOf`, `sqlBoolLiteralValue`) describe a
+real cross-dialect category — not just a T-SQL quirk. The same restriction
+applies to **Oracle** (no SQL-level BOOLEAN at all), **Sybase ASE** (same
+lineage as MSSQL), and **DB2 LUW before 11.1** (BOOLEAN added in 2016).
+None of those dialects ship in Malloy today, so MSSQL is currently the only
+consumer; keep the abstraction in place if/when one of them lands rather
+than collapsing the flag back into MSSQL-internal logic.
 
 Wrap sites are called explicitly at value boundaries:
 - `FieldInstanceField.generateValueExpression()` — new method that wraps when
@@ -272,6 +285,54 @@ In `packages/malloy/src/dialect/mssql/function_overrides.ts`:
 `]]` escape. `quoteTablePath` splits on `.` and quotes each segment, so
 `malloytest.airports` becomes `[malloytest].[airports]`.
 
+### Optional `(NOLOCK)` table hints (2026-05-07)
+
+`MSSQLDialect.useNolockHints` (default `false`) — when `true`, every table
+reference in the compiled SQL gets a `(NOLOCK)` hint appended (read
+uncommitted, no shared locks taken). Toggle the global registered
+instance:
+
+```ts
+import {getDialect, MSSQLDialect} from '@malloydata/malloy';
+(getDialect('mssql') as MSSQLDialect).useNolockHints = true;
+```
+
+(Required exporting `getDialect` from `packages/malloy/src/index.ts`.)
+
+Use case: warehouse / reporting queries reading from an OLTP database
+where the report shouldn't block writers. The shared form
+`SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` at connection open
+would be cleaner architecturally but requires plumbing through
+`MSSQLConnection`; this flag is the smaller change.
+
+**Why bare `(NOLOCK)` and not `WITH (NOLOCK)`:** T-SQL parses
+`FROM [tbl] WITH (NOLOCK) AS alias` as a syntax error — the modern
+`WITH (...)` hint form must come *after* the table alias. Malloy's core
+composes the FROM clause as `<quoteTablePath> as <alias>` with the alias
+appended by the caller, so the dialect can't inject anything between
+the table and its alias. The older `(NOLOCK)` form is accepted before
+the alias (`FROM [tbl] (NOLOCK) as alias`); Microsoft marks it
+"deprecated" but it still works through SQL Server 2022. If a future
+release removes it, the alternative is a per-connection
+`SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` at session start.
+
+### String literal `N` prefix — only when needed (2026-05-07)
+
+`sqlLiteralString` emits ASCII-only literals as plain `'lit'` and reserves
+`N'lit'` for literals containing non-ASCII characters. Reason: in T-SQL,
+`varchar_col = N'lit'` forces a per-row implicit conversion of the column
+(plan-affecting convert warning, kills cardinality estimates), while
+`nvarchar_col = 'lit'` is fine — SQL Server promotes the literal to
+nvarchar **once** at compile time. Default is therefore plain `'lit'`,
+which is safe in both directions; the `N` prefix is only required to
+preserve characters ASCII can't represent.
+
+Confirmed against a 95M-row production query: this fix removed all three
+`PlanAffectingConvert.ConvertIssue = Cardinality Estimate` warnings (one
+on `varchar StationName`, one on `varchar StationID`, and one on the
+CONCAT result type — adding an `N'-'` separator was poisoning the result
+type even though every input was varchar).
+
 ### Sampling
 
 `sqlSampleTable` uses `TOP N ... ORDER BY NEWID()` for row sampling and
@@ -305,6 +366,77 @@ boolean predicate-vs-value story consistent across the filter compiler and
 expression compiler. Today the SELECT-list `generateValueExpression()` wrap
 covers most cases but leaks for things like `concat(x, true)`,
 `JSON_OBJECT('k': complex_bool_expr)`, etc.
+
+### `!=`, `!like`, `not <bit>` and BIT/predicate-mixing — fixed, but undertested (2026-05-07)
+
+T-SQL's strictness about predicate-vs-value contexts surfaces in several
+places that the cross-dialect test suite doesn't exercise. All four are
+fixed; none have regression coverage in `db-all`. Add tests when touching
+this area.
+
+**1. `COALESCE(<predicate>, <predicate>)` — parser-rejected.** The
+expression compiler used to emit `COALESCE(NOT <expr>, true)` for `not`,
+`COALESCE(<a>!=<b>, true)` for `!=`, and `COALESCE(<like_compare>, true)`
+for `!like`. T-SQL refuses this at parse time; COALESCE strictly takes
+values. Three new dialect hooks now route these through the dialect:
+- `Dialect.sqlNullSafeNotEq(left, right)` — default keeps the COALESCE
+  form; MSSQL returns `(left IS NULL OR right IS NULL OR left!=right)`.
+- `Dialect.sqlNullSafeNot(inner)` — default keeps `COALESCE(NOT inner,
+  true)`; MSSQL promotes inner to a BIT value (via the idempotent
+  `sqlBoolValueOf`), COALESCEs with `CAST(0 AS BIT)`, and re-tests as a
+  predicate.
+- `Dialect.sqlNullSafeNotLike(compare, leftSql)` — default keeps
+  `COALESCE(compare, true)`; MSSQL returns
+  `(leftSql IS NULL OR compare)`.
+
+**2. `IIF(<bit>, ...)` — non-boolean error.** T-SQL's IIF first arg must
+be a Boolean expression; a bare BIT column doesn't qualify (despite BIT
+working as a predicate in WHERE/CASE/etc). `generateValueExpression`
+called `sqlBoolValueOf` on every boolean-typed result field, including
+field-rename aliases like `Independent is stations.Independent`, producing
+invalid `IIF(<bit_col>, ...)`. Fixed by making MSSQL's
+`sqlBoolValueOf` idempotent: BIT-shaped inputs (column ref, `CAST(...AS
+BIT)`, `IIF(...)`, `NULL`) pass through.
+
+**3. `<predicate> = <bit_value>` — parser-rejected.** When `is_giftcard
+= false` compiles, the `false` literal becomes `CAST(0 AS BIT)` (value),
+but the LHS is a `(LIKE)` predicate. T-SQL rejects `(<pred>) = <value>`.
+Fixed in `expression_compiler.ts` `case '=':`: when one side is a boolean
+literal getting coerced to a value, the other side is also promoted via
+`sqlBoolValueOf` so the comparison is always value=value (or
+predicate=predicate when neither is a literal). The same fix is applied
+to `case '!=':`.
+
+**4. `<bit> AND <predicate>` — non-boolean error.** T-SQL's logical
+operators (`AND`/`OR`) require predicates on both sides; a bare BIT
+column is a value here, not a predicate (unlike WHERE-context BIT). Fixed
+in `expression_compiler.ts` `case 'and':`/`case 'or':`: each side now
+routes through `dialect.sqlBoolPredicateOf`. Default is identity; MSSQL's
+override is also idempotent — wraps BIT-shaped values with
+`(<v><>CAST(0 AS BIT))` and passes already-shaped predicates through.
+
+**Repros that should be added** to a db-all spec (none exist today):
+```malloy
+source: s is mssql.table('malloytest.state_facts') extend {
+  primary_key: state
+  dimension:
+    not_ca is state != 'CA'
+    is_west is state = ('CA' | 'OR' | 'WA')
+    not_west is is_west = false               // boolean = literal
+    west_and_pop is is_west and popular_flag  // BIT AND <predicate>
+}
+run: s -> { aggregate: c is count() { where: not_ca } }
+run: s -> { aggregate: c is count() { where: not is_west } }
+run: s -> { aggregate: c is count() { where: state !~ 'CA' } }
+run: s -> { aggregate: c is count() { where: not_west } }
+run: s -> { aggregate: c is count() { where: west_and_pop } }
+```
+All five compile and execute correctly today on MSSQL; without the fixes
+above each one parser-fails before reaching the database.
+
+The 577 passing db-all tests don't cover any of these paths. Real-world
+queries like the funcard period-totals report (compile-pta.ts) trip every
+one of them in the same model.
 
 ## How to extend the dialect safely
 

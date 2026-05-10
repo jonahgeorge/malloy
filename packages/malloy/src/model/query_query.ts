@@ -4,7 +4,6 @@
  */
 
 import type {
-  Dialect,
   DialectFieldList,
   CompiledOrderBy,
   LateralJoinExpression,
@@ -86,51 +85,6 @@ import {mkBuildID} from './source_def_utils';
 
 function pathToCol(path: string[]): string {
   return path.map(el => encodeURIComponent(el)).join('/');
-}
-
-// Heuristic: does an expression reference an actual column? T-SQL rejects
-// `GROUP BY <constant-only-expression>`. We strip string literals first so
-// quoted column-like text doesn't fool us, then look for a bracket-quoted
-// identifier ([col]) — Malloy always emits bracketed identifiers for MSSQL
-// column references. Pure literals, arithmetic on literals, and parameter
-// substitutions never produce a `[`.
-function hasColumnReference(expr: string): boolean {
-  // Strip string literals so quoted text can't masquerade as identifiers.
-  const stripped = expr.replace(/'(?:[^']|'')*'/g, '');
-  // Real column references in MSSQL output are bracketed (`[col]` or
-  // `base.[col]`). The lone exception is `group_set`/`GROUP_SET`, which is the
-  // bareword column added by the dialect's CROSS JOIN VALUES table.
-  if (/\[[^\]]*\]/.test(stripped)) return true;
-  return /\bgroup_set\b/i.test(stripped);
-}
-
-// For dialects that disallow positional GROUP BY (e.g. T-SQL), turn a list
-// of 1-based indexes into the corresponding SELECT-list expressions, with the
-// trailing ` as <alias>` stripped. Each entry of `selectSQL` is shaped like
-// "  <expression> as <alias>".
-function groupByClause(
-  dialect: Dialect,
-  indexes: number[],
-  selectSQL: string[]
-): string {
-  if (!dialect.groupByExpression) {
-    return indexes.join(',');
-  }
-  const exprs = indexes
-    .map(i => {
-      const entry = selectSQL[i - 1];
-      // Alias can be \S+ (unquoted), `[...]` (T-SQL), `"..."`, or `\`...\``.
-      const m = entry.match(
-        /^([\s\S]+?)\s+as\s+(?:\[[^\]]*\]|"[^"]*"|`[^`]*`|\S+)\s*$/i
-      );
-      return (m ? m[1] : entry).trim();
-    })
-    // Drop pure literals — T-SQL rejects `GROUP BY <constant>`. A row group
-    // partitioned only by constants collapses to one row anyway, so omitting
-    // the constant from GROUP BY preserves semantics. Heuristic: no `[` or `.`
-    // means no column/path reference (possibly a unicode-prefixed string).
-    .filter(e => hasColumnReference(e));
-  return exprs.join(', ');
 }
 
 interface OutputPipelinedSQL {
@@ -1251,26 +1205,14 @@ export class QueryQuery extends QueryField {
 
     const orderBy = queryDef.orderBy || resultStruct.calculateDefaultOrderBy();
     const o: string[] = [];
-    // For dialects without NULLS LAST (T-SQL): add a leading "is null" sort
-    // term that pushes nulls to the end. We only do this when we can write
-    // the underlying expression (scalar fields whose getSQL is a column or
-    // CASE over base columns) — aggregate aliases cannot appear inside
-    // CASE in T-SQL ORDER BY.
     const dialect = this.parent.dialect;
-    const wantNullLastFlag = dialect.nullsLastWantsFlag;
-    // T-SQL has no NULLS LAST. Add a leading sort term that pushes nulls
-    // to the end. T-SQL won't bind SELECT-list aliases inside CASE in
-    // ORDER BY, so we have to use the underlying expression and only when
-    // it's a simple `[col]` / `<alias>.[col]` reference that resolves in
-    // the FROM scope. Aggregates and complex CASE/CAST expressions keep
-    // T-SQL's default null sort.
-    const simpleColRef = /^[\w]*\.?\[[^\]]+\]$/;
+    // For dialects without `NULLS LAST` (T-SQL), prepend a leading sort
+    // term that pushes nulls to the end. The dialect decides whether the
+    // field's underlying expression is shaped suitably for the flag.
     const addNullFlag = (fi: FieldInstanceField) => {
-      if (!wantNullLastFlag) return;
       if (!isScalarField(fi.f)) return;
-      const expr = fi.getSQL();
-      if (!simpleColRef.test(expr.trim())) return;
-      o.push(`CASE WHEN ${expr} IS NULL THEN 1 ELSE 0 END ASC`);
+      const flag = dialect.sqlOrderByNullFlag(fi.getSQL());
+      if (flag !== undefined) o.push(flag);
     };
     for (const f of orderBy) {
       if (typeof f.field === 'string') {
@@ -1341,26 +1283,19 @@ export class QueryQuery extends QueryField {
 
     // group by
     if (this.firstSegment.type === 'reduce') {
-      const useExpr = this.parent.dialect.groupByExpression;
-      const n: string[] = [];
+      const indexes: number[] = [];
       for (const field of this.rootResult.fields()) {
         const fi = field as FieldInstanceField;
         if (fi.fieldUsage.type === 'result' && isScalarField(fi.f)) {
-          if (useExpr) {
-            // GROUP BY must match the SELECT-list shape (which uses the value
-            // form for booleans on dialects like T-SQL).
-            const expr = fi.generateValueExpression();
-            // Skip pure literals — T-SQL rejects them in GROUP BY.
-            if (hasColumnReference(expr)) {
-              n.push(expr);
-            }
-          } else {
-            n.push(fi.fieldUsage.resultIndex.toString());
-          }
+          indexes.push(fi.fieldUsage.resultIndex);
         }
       }
-      if (n.length > 0) {
-        s += `GROUP BY ${n.join(useExpr ? ', ' : ',')}\n`;
+      if (indexes.length > 0) {
+        // Dialects (T-SQL) that filter constants from GROUP BY may return
+        // an empty string when every entry is filtered out — skip GROUP BY
+        // entirely in that case.
+        const gb = this.parent.dialect.sqlGroupBy(indexes, fields);
+        if (gb.length > 0) s += `GROUP BY ${gb}\n`;
       }
     }
 
@@ -1773,10 +1708,8 @@ export class QueryQuery extends QueryField {
       throw new Error('PROJECT cannot be used on queries with turtles');
     }
 
-    const groupBy =
-      'GROUP BY ' +
-      groupByClause(this.parent.dialect, f.dimensionIndexes, f.sql) +
-      '\n';
+    const gb = this.parent.dialect.sqlGroupBy(f.dimensionIndexes, f.sql);
+    const groupBy = gb.length > 0 ? `GROUP BY ${gb}\n` : '';
 
     from += this.parent.dialect.sqlGroupSetTable(this.maxGroupSet) + '\n';
 
@@ -1912,11 +1845,8 @@ export class QueryQuery extends QueryField {
       s += `WHERE ${where}\n`;
     }
     if (f.dimensionIndexes.length > 0) {
-      s += `GROUP BY ${groupByClause(
-        this.parent.dialect,
-        f.dimensionIndexes,
-        f.sql
-      )}\n`;
+      const gb = this.parent.dialect.sqlGroupBy(f.dimensionIndexes, f.sql);
+      if (gb.length > 0) s += `GROUP BY ${gb}\n`;
     }
 
     this.resultStage = stageWriter.addStage(s);
@@ -2007,11 +1937,8 @@ export class QueryQuery extends QueryField {
     }
 
     if (dimensionIndexes.length > 0) {
-      s += `GROUP BY ${groupByClause(
-        this.parent.dialect,
-        dimensionIndexes,
-        fieldsSQL
-      )}\n`;
+      const gb = this.parent.dialect.sqlGroupBy(dimensionIndexes, fieldsSQL);
+      if (gb.length > 0) s += `GROUP BY ${gb}\n`;
     }
 
     // order by
@@ -2508,11 +2435,10 @@ class QueryQueryIndexStage extends QueryQuery {
 
     s += this.generateSQLFilters(this.rootResult, 'where').sql('where');
 
-    if (dialect.groupByExpression) {
-      s += `GROUP BY group_set, ${nameCase}, ${pathCase}, ${typeCase}, ${valueCase}\n`;
-    } else {
-      s += 'GROUP BY 1,2,3,4,5\n';
-    }
+    s += `GROUP BY ${dialect.sqlGroupBy(
+      [1, 2, 3, 4, 5],
+      ['group_set', nameCase, pathCase, typeCase, valueCase]
+    )}\n`;
 
     // limit
     if (!isRawSegment(this.firstSegment) && this.firstSegment.limit) {

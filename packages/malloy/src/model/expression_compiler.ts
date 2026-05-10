@@ -217,48 +217,61 @@ function compileExpr<T extends Expr>(
       case '>=':
       case '<=':
       case '=': {
-        let leftSql = expr.kids.left.sql ?? '';
-        let rightSql = expr.kids.right.sql ?? '';
-        // T-SQL: comparing a BIT column with a boolean literal needs the
-        // value form (`CAST(1 AS BIT)`) — comparing against the predicate
-        // form `(1=1)` produces a syntax error since `<col>=<predicate>`
-        // mixes value with predicate.
-        if (expr.node === '=' && context.dialect.boolPredicatesNotValues) {
-          if (expr.kids.right.node === 'true') {
-            rightSql = 'CAST(1 AS BIT)';
-          } else if (expr.kids.right.node === 'false') {
-            rightSql = 'CAST(0 AS BIT)';
-          }
-          if (expr.kids.left.node === 'true') {
-            leftSql = 'CAST(1 AS BIT)';
-          } else if (expr.kids.left.node === 'false') {
-            leftSql = 'CAST(0 AS BIT)';
-          }
+        // For dialects (T-SQL) where bare boolean literals compile to a
+        // predicate but a comparison operand is a *value* context, swap in
+        // the value form on either side via the dialect hook. If only ONE
+        // side is a literal (and gets value-coerced), the other side may
+        // be a predicate — promote it to a value too via sqlBoolValueOf so
+        // the comparison stays value=value.
+        const isLit = (side: {node?: string}) =>
+          side.node === 'true' || side.node === 'false';
+        const litValue = (side: typeof expr.kids.left | typeof expr.kids.right) =>
+          isLit(side)
+            ? context.dialect.sqlBoolLiteralValue(side.node as 'true' | 'false')
+            : undefined;
+        const leftLit = litValue(expr.kids.left);
+        const rightLit = litValue(expr.kids.right);
+        let leftSql = leftLit ?? expr.kids.left.sql ?? '';
+        let rightSql = rightLit ?? expr.kids.right.sql ?? '';
+        if (leftLit !== undefined && rightLit === undefined) {
+          rightSql = context.dialect.sqlBoolValueOf(rightSql);
+        } else if (rightLit !== undefined && leftLit === undefined) {
+          leftSql = context.dialect.sqlBoolValueOf(leftSql);
         }
         return `${leftSql}${expr.node}${rightSql}`;
       }
       // Malloy inequality comparisons always return a boolean
       case '!=': {
-        let leftSql = expr.kids.left.sql ?? '';
-        let rightSql = expr.kids.right.sql ?? '';
-        if (context.dialect.boolPredicatesNotValues) {
-          if (expr.kids.right.node === 'true') {
-            rightSql = 'CAST(1 AS BIT)';
-          } else if (expr.kids.right.node === 'false') {
-            rightSql = 'CAST(0 AS BIT)';
-          }
-          if (expr.kids.left.node === 'true') {
-            leftSql = 'CAST(1 AS BIT)';
-          } else if (expr.kids.left.node === 'false') {
-            leftSql = 'CAST(0 AS BIT)';
-          }
+        const isLit = (side: {node?: string}) =>
+          side.node === 'true' || side.node === 'false';
+        const litValue = (
+          side: typeof expr.kids.left | typeof expr.kids.right
+        ) =>
+          isLit(side)
+            ? context.dialect.sqlBoolLiteralValue(side.node as 'true' | 'false')
+            : undefined;
+        const leftLit = litValue(expr.kids.left);
+        const rightLit = litValue(expr.kids.right);
+        let leftSql = leftLit ?? expr.kids.left.sql ?? '';
+        let rightSql = rightLit ?? expr.kids.right.sql ?? '';
+        if (leftLit !== undefined && rightLit === undefined) {
+          rightSql = context.dialect.sqlBoolValueOf(rightSql);
+        } else if (rightLit !== undefined && leftLit === undefined) {
+          leftSql = context.dialect.sqlBoolValueOf(leftSql);
         }
-        const notEqual = `${leftSql}!=${rightSql}`;
-        return `COALESCE(${notEqual},${context.dialect.sqlBoolean(true)})`;
+        return context.dialect.sqlNullSafeNotEq(leftSql, rightSql);
       }
       case 'and':
       case 'or':
-        return `${expr.kids.left.sql} ${expr.node} ${expr.kids.right.sql}`;
+        // T-SQL rejects `<bit> AND <pred>`: AND/OR need predicates on both
+        // sides. Route through `sqlBoolPredicateOf`, which is identity on
+        // dialects with native BOOLEAN and a value→predicate promotion on
+        // dialects (T-SQL) where bare BIT can't be combined with logical ops.
+        return `${context.dialect.sqlBoolPredicateOf(
+          expr.kids.left.sql ?? ''
+        )} ${expr.node} ${context.dialect.sqlBoolPredicateOf(
+          expr.kids.right.sql ?? ''
+        )}`;
       case 'coalesce':
         return `COALESCE(${expr.kids.left.sql},${expr.kids.right.sql})`;
       case 'in': {
@@ -278,13 +291,16 @@ function compileExpr<T extends Expr>(
             : `${expr.kids.left.sql} ${likeIt} ${expr.kids.right.sql}`;
         return expr.node === 'like'
           ? compare
-          : `COALESCE(${compare},${context.dialect.sqlBoolean(true)})`;
+          : context.dialect.sqlNullSafeNotLike(
+              compare,
+              expr.kids.left.sql ?? ''
+            );
       }
       case '()':
         return `(${expr.e.sql})`;
       case 'not':
         // Malloy not operator always returns a boolean
-        return `COALESCE(NOT ${expr.e.sql},${context.dialect.sqlBoolean(true)})`;
+        return context.dialect.sqlNullSafeNot(expr.e.sql ?? '');
       case 'unary-':
         return `-${expr.e.sql}`;
       case 'is-null':
@@ -1046,30 +1062,26 @@ export function generateSourceReference(
 }
 
 export function generateCaseSQL(pf: CaseExpr, dialect?: Dialect): string {
-  // For dialects that emit booleans as predicates, the THEN/ELSE positions
-  // are *value* contexts: a bare predicate like `(1=1)` is a syntax error in
-  // T-SQL CASE results. Wrap any bare boolean-literal child with a BIT value.
-  const valueOf = (sql: string | undefined, node: string | undefined) => {
-    if (
-      dialect?.boolPredicatesNotValues &&
-      (node === 'true' || node === 'false')
-    ) {
-      return node === 'true' ? 'CAST(1 AS BIT)' : 'CAST(0 AS BIT)';
+  // THEN/ELSE positions are value contexts. For dialects that emit a
+  // boolean literal as a predicate (T-SQL: `(1=1)`), the dialect hook
+  // returns the value form to use here instead.
+  const valueOf = (kid: {sql?: string; node?: string}) => {
+    if (kid.node === 'true' || kid.node === 'false') {
+      return dialect?.sqlBoolLiteralValue(kid.node) ?? kid.sql;
     }
-    return sql;
+    return kid.sql;
   };
   const caseStmt = ['CASE'];
   if (pf.kids.caseValue !== undefined) {
     caseStmt.push(`${pf.kids.caseValue.sql}`);
   }
   for (let i = 0; i < pf.kids.caseWhen.length; i += 1) {
-    const thenExpr = pf.kids.caseThen[i];
-    const thenSql = valueOf(thenExpr.sql, thenExpr.node);
-    caseStmt.push(`WHEN ${pf.kids.caseWhen[i].sql} THEN ${thenSql}`);
+    caseStmt.push(
+      `WHEN ${pf.kids.caseWhen[i].sql} THEN ${valueOf(pf.kids.caseThen[i])}`
+    );
   }
   if (pf.kids.caseElse !== undefined) {
-    const elseSql = valueOf(pf.kids.caseElse.sql, pf.kids.caseElse.node);
-    caseStmt.push(`ELSE ${elseSql}`);
+    caseStmt.push(`ELSE ${valueOf(pf.kids.caseElse)}`);
   }
   caseStmt.push('END');
   return caseStmt.join(' ');
