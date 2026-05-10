@@ -1106,14 +1106,24 @@ export function generateCaseSQL(pf: CaseExpr, dialect?: Dialect): string {
     }
     return kid.sql;
   };
+  // WHEN positions are predicate contexts. With a `caseValue` (searched
+  // CASE: `CASE <v> WHEN <a> ...`), the WHEN is a value comparand. Without
+  // `caseValue`, the WHEN must be a predicate — but on dialects where
+  // boolean is a value type (T-SQL BIT) a bare boolean column ref or
+  // `IIF(...)` is a value, not a predicate. Promote via the dialect hook.
+  const predicateOf = (kid: {sql?: string}) => {
+    return dialect?.sqlBoolPredicateOf(kid.sql ?? '') ?? kid.sql;
+  };
   const caseStmt = ['CASE'];
+  const isSearched = pf.kids.caseValue === undefined;
   if (pf.kids.caseValue !== undefined) {
     caseStmt.push(`${pf.kids.caseValue.sql}`);
   }
   for (let i = 0; i < pf.kids.caseWhen.length; i += 1) {
-    caseStmt.push(
-      `WHEN ${pf.kids.caseWhen[i].sql} THEN ${valueOf(pf.kids.caseThen[i])}`
-    );
+    const whenSQL = isSearched
+      ? predicateOf(pf.kids.caseWhen[i])
+      : pf.kids.caseWhen[i].sql;
+    caseStmt.push(`WHEN ${whenSQL} THEN ${valueOf(pf.kids.caseThen[i])}`);
   }
   if (pf.kids.caseElse !== undefined) {
     caseStmt.push(`ELSE ${valueOf(pf.kids.caseElse)}`);

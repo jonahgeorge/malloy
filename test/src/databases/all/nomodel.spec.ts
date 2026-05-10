@@ -836,6 +836,21 @@ runtimes.runtimeMap.forEach((runtime, databaseName) => {
     }
   );
 
+  // Repro: a bare boolean column ref used as the WHEN predicate of a
+  // `pick … when <col>` is invalid in T-SQL, because BIT is a value, not
+  // a predicate. SQL Server rejects it with:
+  //   Msg 4145: An expression of non-boolean type specified in a context
+  //   where a condition is expected, near 'THEN'.
+  // The dialect must promote the bare BIT ref to a predicate.
+  it(`pick when <bool-column> - ${databaseName}`, async () => {
+    const testModel = wrapTestModel(runtime, '');
+    await expect(`
+        run: ${databaseName}.table('malloytest.alltypes') -> {
+          select: flag is pick 1 when t_bool_true else 0
+        }
+      `).toMatchPaths(testModel, {flag: 1});
+  });
+
   // Repro: with `all()` introducing a compute-only group_set, the stage-0
   // GROUP BY emits the group-by'd column wrapped as
   // `CASE WHEN group_set=N THEN <col> END`. A non-aggregate sub-expression
