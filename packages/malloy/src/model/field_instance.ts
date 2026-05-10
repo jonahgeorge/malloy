@@ -22,7 +22,7 @@ import {
   mergeUniqueKeyRequirement,
   isTemporalType,
 } from './malloy_types';
-import {AndChain, caseGroup, type GenerateState} from './utils';
+import {AndChain, caseGroup, GenerateState} from './utils';
 import {JoinInstance} from './join_instance';
 import {
   isBasicAggregate,
@@ -89,7 +89,22 @@ export class FieldInstanceField implements FieldInstance {
     return exp;
   }
 
-  generateExpression(): string {
+  /**
+   * Variant of `getSQL()` for emitting an aggregate measure's expression as
+   * the outer SELECT-list entry in stage 0. Sets `inMeasureSelect` on the
+   * generation state so that under `dialect.strictGroupByReferences` (MSSQL)
+   * non-aggregate column references inside the expression (e.g. inside a
+   * `pick … when <col> = …` condition) are wrapped to match the GROUP BY
+   * shape. Other dialects: equivalent to `getSQL()` for non-scalar fields.
+   */
+  getMeasureSelectSQL() {
+    if (isScalarField(this.f)) {
+      return this.getSQL();
+    }
+    return this.generateExpression(true);
+  }
+
+  generateExpression(forMeasureSelect = false): string {
     if (!FieldInstanceField.exprCompiler) {
       throw new Error(
         'Expression compiler not registered with FieldInstanceField'
@@ -105,10 +120,14 @@ export class FieldInstanceField implements FieldInstance {
 
     // Normal field expression generation
     if (hasExpression(this.f.fieldDef)) {
+      const state = forMeasureSelect
+        ? new GenerateState().withMeasureSelect()
+        : undefined;
       return FieldInstanceField.exprCompiler(
         this.parent,
         this.f.parent,
-        this.f.fieldDef.e
+        this.f.fieldDef.e,
+        state
       );
     }
 

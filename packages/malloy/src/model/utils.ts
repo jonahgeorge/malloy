@@ -281,12 +281,21 @@ export class GenerateState {
   whereSQL?: string;
   applyValue?: string;
   totalGroupSet = -1;
+  // True when compiling an outer-measure SELECT-list expression, which
+  // tells `generateFieldFragment` (under `dialect.strictGroupByReferences`)
+  // to wrap non-aggregate column references in the same `CASE WHEN
+  // group_set IN (...) THEN <col> END` shape used by the GROUP BY. Cleared
+  // when entering a sub-context (filter / aggregate) that runs before or
+  // independently of grouping.
+  inMeasureSelect = false;
 
   withWhere(s?: string): GenerateState {
     const newState = new GenerateState();
     newState.whereSQL = s;
     newState.applyValue = this.applyValue;
     newState.totalGroupSet = this.totalGroupSet;
+    // Filters run before GROUP BY — don't wrap field refs there.
+    newState.inMeasureSelect = false;
     return newState;
   }
 
@@ -295,6 +304,7 @@ export class GenerateState {
     newState.whereSQL = this.whereSQL;
     newState.applyValue = s;
     newState.totalGroupSet = this.totalGroupSet;
+    newState.inMeasureSelect = this.inMeasureSelect;
     return newState;
   }
 
@@ -303,6 +313,26 @@ export class GenerateState {
     newState.whereSQL = this.whereSQL;
     newState.applyValue = this.applyValue;
     newState.totalGroupSet = groupSet;
+    newState.inMeasureSelect = this.inMeasureSelect;
+    return newState;
+  }
+
+  withMeasureSelect(): GenerateState {
+    const newState = new GenerateState();
+    newState.whereSQL = this.whereSQL;
+    newState.applyValue = this.applyValue;
+    newState.totalGroupSet = this.totalGroupSet;
+    newState.inMeasureSelect = true;
+    return newState;
+  }
+
+  withoutMeasureSelect(): GenerateState {
+    if (!this.inMeasureSelect) return this;
+    const newState = new GenerateState();
+    newState.whereSQL = this.whereSQL;
+    newState.applyValue = this.applyValue;
+    newState.totalGroupSet = this.totalGroupSet;
+    newState.inMeasureSelect = false;
     return newState;
   }
 }

@@ -1376,7 +1376,14 @@ export class QueryQuery extends QueryField {
       );
       if (fi instanceof FieldInstanceField) {
         if (fi.fieldUsage.type === 'result') {
-          const exp = fi.getSQL();
+          // For aggregate-measure fields, use getMeasureSelectSQL() so that
+          // strict-GROUP-BY dialects (MSSQL) wrap non-aggregate column
+          // refs inside the measure expression to match the GROUP BY shape.
+          // Scalar fields go through getSQL() (which already caseGroup-wraps
+          // the whole expression at the SELECT level).
+          const exp = isScalarField(fi.f)
+            ? fi.getSQL()
+            : fi.getMeasureSelectSQL();
           if (isScalarField(fi.f)) {
             if (
               this.parent.dialect.cantPartitionWindowFunctionsOnExpressions &&

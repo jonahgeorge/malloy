@@ -836,6 +836,29 @@ runtimes.runtimeMap.forEach((runtime, databaseName) => {
     }
   );
 
+  // Repro: with `all()` introducing a compute-only group_set, the stage-0
+  // GROUP BY emits the group-by'd column wrapped as
+  // `CASE WHEN group_set=N THEN <col> END`. A non-aggregate sub-expression
+  // inside a measure (e.g. `pick … when <col> = …`) emits a *bare* ref to
+  // the same column, which strict-GROUP-BY dialects (T-SQL/MSSQL) reject:
+  //   Msg 8120: Column '<col>' is invalid in the select list because it is
+  //   not contained in either an aggregate function or the GROUP BY clause.
+  it(`ungrouped + pick on group-by'd column - ${databaseName}`, async () => {
+    const testModel = wrapTestModel(runtime, '');
+    await expect(`
+        run: ${databaseName}.table('malloytest.airports') extend {
+          measure: c is count()
+        } -> {
+          where: state = 'TX' | 'NY'
+          group_by: state
+          aggregate:
+            c
+            all_c is all(c)
+            tx_zero is pick 0 when state = 'TX' else c
+        }
+      `).toMatchPaths(testModel, {'all_c': 2421});
+  });
+
   test.when(runtime.supportsNesting)(
     `ungrouped - all nested - ${databaseName}`,
     async () => {

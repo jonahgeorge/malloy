@@ -161,6 +161,7 @@ export class MSSQLDialect extends Dialect {
   // separate path that takes the SELECT-list expression list.
   orderByClause: OrderByClauseType = 'ordinal';
   boolPredicatesNotValues = true;
+  strictGroupByReferences = true;
 
   // T-SQL rejects positional ordinals in GROUP BY (`GROUP BY 1` groups by
   // the constant 1) and rejects pure literals there too. Re-emit the

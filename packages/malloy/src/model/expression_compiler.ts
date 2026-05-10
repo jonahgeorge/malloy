@@ -124,18 +124,32 @@ function compileExpr<T extends Expr>(
    * Translate the children first, and stash the translation
    * in the nodes themselves, so that if we call into the dialect
    * it will have access to the translated children.
+   *
+   * Aggregate / ungrouped nodes "consume" the `inMeasureSelect` flag —
+   * inside them, column refs are evaluated against the aggregated row
+   * set, not the outer SELECT-list group_set, so the strict-GROUP-BY
+   * wrap in `generateFieldFragment` would gate them on the wrong groups
+   * (e.g. wrap `births` inside `births.sum()` with `group_set=1` would
+   * make `all(total_births)` see NULLs on the compute-only group_set).
+   * Clear the flag before recursing into their children.
    */
+  const childState =
+    expr.node === 'aggregate' ||
+    expr.node === 'all' ||
+    expr.node === 'exclude'
+      ? state.withoutMeasureSelect()
+      : state;
   if (exprHasE(expr)) {
-    compileExpr(resultSet, context, expr.e, state);
+    compileExpr(resultSet, context, expr.e, childState);
   } else if (exprHasKids(expr)) {
     for (const kidExpr of Object.values(expr.kids)) {
       if (kidExpr === null) continue;
       if (Array.isArray(kidExpr)) {
         for (const e of kidExpr) {
-          compileExpr(resultSet, context, e, state);
+          compileExpr(resultSet, context, e, childState);
         }
       } else {
-        compileExpr(resultSet, context, kidExpr, state);
+        compileExpr(resultSet, context, kidExpr, childState);
       }
     }
   }
@@ -166,19 +180,23 @@ function compileExpr<T extends Expr>(
           stringsFromSQLExpression(resultSet, context, expr, state)
         ).join('');
       case 'aggregate': {
+        // Clear inMeasureSelect for inner aggregate compilation: the
+        // strict-GROUP-BY wrap in generateFieldFragment is for non-
+        // aggregate refs only.
+        const aggState = state.withoutMeasureSelect();
         let agg = '';
         if (expr.function === 'sum') {
-          agg = generateSumFragment(resultSet, context, expr, state);
+          agg = generateSumFragment(resultSet, context, expr, aggState);
         } else if (expr.function === 'avg') {
-          agg = generateAvgFragment(resultSet, context, expr, state);
+          agg = generateAvgFragment(resultSet, context, expr, aggState);
         } else if (expr.function === 'count') {
-          agg = generateCountFragment(resultSet, context, expr, state);
+          agg = generateCountFragment(resultSet, context, expr, aggState);
         } else if (
           expr.function === 'min' ||
           expr.function === 'max' ||
           expr.function === 'distinct'
         ) {
-          agg = generateSymmetricFragment(resultSet, context, expr, state);
+          agg = generateSymmetricFragment(resultSet, context, expr, aggState);
         } else {
           throw new Error(
             `Internal Error: Unknown aggregate function ${expr.function}`
@@ -814,7 +832,7 @@ export function generateFieldFragment(
     }
 
     // The normal case - just generate the SQL reference
-    return sqlFullChildReference(
+    const sql = sqlFullChildReference(
       fieldRef.parent,
       fieldRef.fieldDef.name,
       fieldRef.parent.structDef.type === 'record'
@@ -824,6 +842,23 @@ export function generateFieldFragment(
           }
         : undefined
     );
+
+    // Strict-GROUP-BY dialects (T-SQL/MSSQL): a non-aggregate column ref
+    // inside a measure's outer SELECT-list expression must syntactically
+    // match the GROUP BY entry, which `FieldInstanceField.getSQL()` shaped
+    // as `CASE WHEN group_set IN (childGroups) THEN <col> END` whenever
+    // ungroup-introduced compute-only group sets push the result's
+    // groupSet above 0. Mirror that wrap here so `pick … when <col> = …`
+    // and similar non-aggregate sub-expressions reference the same shape.
+    if (
+      state.inMeasureSelect &&
+      context.dialect.strictGroupByReferences &&
+      resultSet.root().isComplexQuery &&
+      resultSet.groupSet > 0
+    ) {
+      return caseGroup(resultSet.childGroups, sql);
+    }
+    return sql;
   }
 }
 
@@ -910,7 +945,7 @@ export function generateUngroupedFragment(
     resultSet,
     context,
     expr.e,
-    state.withTotal(totalGroupSet)
+    state.withoutMeasureSelect().withTotal(totalGroupSet)
   );
 
   const fields = resultSet.getUngroupPartitions(ungroupSet);

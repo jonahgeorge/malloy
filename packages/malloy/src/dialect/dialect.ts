@@ -232,6 +232,17 @@ export abstract class Dialect {
   // in place if/when an Oracle or Sybase dialect lands.
   boolPredicatesNotValues = false;
 
+  // When true, non-aggregate column references that appear inside a
+  // measure's outer SELECT-list expression (e.g. inside a `pick … when
+  // <col> = …` condition) must syntactically match the GROUP BY entry
+  // for that column. With `all()` / `exclude()` widening the GROUPING
+  // SETS, the GROUP BY entry becomes `CASE WHEN group_set IN (childGroups)
+  // THEN <col> END`, so the bare reference inside the measure expression
+  // would be rejected by strict-GROUP-BY engines. T-SQL/MSSQL is the
+  // current consumer; PostgreSQL would also benefit if the same shape ever
+  // surfaces there. See `generateFieldFragment` for the wrap site.
+  strictGroupByReferences = false;
+
   /**
    * Wrap a predicate (`x > 0`, `(1=1)`, `like`-tests, etc.) into a value
    * suitable for SELECT lists and other value contexts. Default is identity.
